@@ -1,0 +1,23 @@
+{
+  "name": "SnappTo — tools that work offline",
+  "short_name": "SnappTo",
+  "description": "Passport photos, PDF, image, QR and calculator tools that work offline. Free and private.",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F4F3F9",
+  "theme_color": "#6C3CF0",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    { "src": "assets/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "assets/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "assets/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Passport photo", "url": "./#/tool/passportphoto", "icons": [{ "src": "assets/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Scan QR", "url": "./#/tool/qrscan", "icons": [{ "src": "assets/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Compress PDF", "url": "./#/tool/pdfcompress", "icons": [{ "src": "assets/icon-192.png", "sizes": "192x192" }] }
+  ]
+}
