@@ -5,7 +5,9 @@
 //   grayscale → paper brightness map (per-block percentile, so uneven light and
 //   shadows don't turn into ink) → ink darkness d = 1 − gray/paper → Otsu
 //   threshold, shifted by the Light…Bold slider → soft alpha for smooth edges →
-//   drop specks and border shadows → crop to the ink + padding.
+//   drop specks, and shadows / lines at the frame (when the frame is clean paper,
+//   as in an already-cropped signature, pen strokes there are kept) → crop to the
+//   ink + padding.
 import {
   h, card, button, busy, field, row, segmented, filePicker, notice, progress, resultCard, fmtBytes, stem, canvasToBlob, jpegUnder,
 } from '../ui.js';
@@ -20,6 +22,8 @@ export const SIGN_WORK = 1600;
 export const SIGN_SPEC = { w: 300, h: 100, maxKB: 20 };
 const BLUE = [0x1a, 0x3f, 0xb5], BLACK = [0, 0, 0], WHITE = [255, 255, 255];
 const NOY = async () => {};
+/** Thrown when a new photo is picked mid-run; doRun() drops it quietly. */
+const STALE = new Error('stale');
 
 /* ───────────────────────── pure analysis (node-testable) ───────────────────────── */
 
@@ -34,7 +38,26 @@ export async function analyzeSignature(rgba, W, H, y_ = NOY) {
   for (let i = 0; i < n; i++) { const v = 1 - gray[i] / (paper[i] < 8 ? 8 : paper[i]); d[i] = v < 0 ? 0 : v > 1 ? 1 : v; }
   const step = Math.max(1, Math.floor(n / 400000)), sub = new Float32Array(Math.ceil(n / step));
   for (let i = 0, j = 0; i < n; i += step, j++) sub[j] = d[i];
-  return { d, W, H, tAuto: clamp(otsu(sub), 0.1, 0.45) };
+  // Is the frame clean paper, as in an already-cropped signature whose ink may touch the edge?
+  // Walk the 1-px frame: pen strokes crossing it make short dark stretches; a table, floor or shadow
+  // at the frame makes one long one.
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < n; i++) hist[gray[i] > 255 ? 255 : gray[i] | 0]++;
+  let p90 = 255;
+  for (let v = 0, cum = 0; v < 256; v++) { cum += hist[v]; if (cum >= 0.9 * n) { p90 = v; break; } }
+  let ring = 0, dark = 0, run = 0, head = -1, longest = 0;
+  const edge = i => {
+    ring++;
+    if (gray[i] < 0.75 * p90) { dark++; if (++run > longest) longest = run; }
+    else { if (head < 0) head = run; run = 0; }
+  };
+  for (let x = 0; x < W; x++) edge(x);                                 // top, left to right
+  for (let y = 1; y < H; y++) edge(y * W + W - 1);                     // right side, downwards
+  if (H > 1) for (let x = W - 2; x >= 0; x--) edge((H - 1) * W + x);   // bottom, right to left
+  if (W > 1) for (let y = H - 2; y > 0; y--) edge(y * W);              // left side, upwards
+  if (head > 0) longest = Math.max(longest, Math.min(ring, run + head)); // a stretch can wrap past the start
+  const cleanFrame = dark < 0.25 * ring && longest < 0.1 * ring;
+  return { d, W, H, tAuto: clamp(otsu(sub), 0.1, 0.45), cleanFrame };
 }
 
 /**
@@ -53,11 +76,30 @@ export function extractInk(an, strength = 0.5) {
     bin[i] = d[i] >= t ? 1 : 0;
   }
   const { labels, comps } = components(bin, W, H);
-  const minArea = Math.max(4, Math.round(n * 5e-6));
-  const keep = comps.map(c => {
-    if (c.area < minArea || c.area > n * 0.2) return false;                 // specks / big dark blobs
+  const minArea = Math.max(4, Math.round(n * 5e-6)), clean = an.cleanFrame;
+  const atFrame = c => c.border && (c.x1 - c.x0 + 1 > W * 0.3 || c.y1 - c.y0 + 1 > H * 0.3);
+  // A clean frame lets pen strokes touch the edge, but a printed line, paper edge or fold can still run off it,
+  // and so can the soft edge of a light shadow. Tell them apart by shape (second moments) and darkness.
+  const K = comps.length, M = clean && comps.some(atFrame) ? new Float64Array(6 * K) : null;
+  if (M) for (let y = 0, i = 0; y < H; y++) for (let x = 0; x < W; x++, i++) {
+    const o = 6 * (labels[i] - 1); if (o < 0) continue;
+    M[o] += x; M[o + 1] += y; M[o + 2] += x * x; M[o + 3] += x * y; M[o + 4] += y * y; M[o + 5] += d[i];
+  }
+  const notInk = k => {
+    const o = 6 * k, a = comps[k].area, mx = M[o] / a, my = M[o + 1] / a;
+    const vx = M[o + 2] / a - mx * mx, cv = M[o + 3] / a - mx * my, vy = M[o + 4] / a - my * my;
+    const half = (vx + vy) / 2, r = Math.sqrt(Math.max(0, half * half - vx * vy + cv * cv));
+    const ratio = (half - r) / (half + r);                                    // variance across it ÷ variance along it
+    // dead straight (spread across under 1% of the spread along), or a long band (under 10%) that is on average
+    // no darker than a light shadow
+    return ratio < 1e-4 || (ratio < 1e-2 && M[o + 5] < 0.25 * a && a > 0.35 * 12 * Math.sqrt(Math.max(0, (half + r) * (half - r))));
+  };
+  const keep = comps.map((c, k) => {
+    if (c.area < minArea) return false;                                         // specks
     const bw = c.x1 - c.x0 + 1, bh = c.y1 - c.y0 + 1;
-    if (c.border && (bw > W * 0.3 || bh > H * 0.3)) return false;           // shadows / table edges at the frame
+    // big dark blobs; in a tight crop a bold signature can be big too, but its box is mostly paper
+    if (c.area > n * 0.2 && (!clean || c.area > bw * bh * 0.5)) return false;
+    if (atFrame(c) && (!clean || notInk(k))) return false;                      // shadows / table edges / printed lines at the frame
     return true;
   });
   const kept = new Uint8Array(n);
@@ -137,14 +179,19 @@ export async function mount(root, toolId) {
     root.append(notice('This tool isn’t available here yet.', 'warn'));
     return;
   }
-  const S = { file: null, src: null, an: null, before: null, ran: false };
+  const S = { file: null, src: null, an: null, before: null, ran: false, gen: 0 };
   const out = h('div');
 
   /* ── input ── */
   const status = h('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } });
   const setStatus = (...nodes) => { status.replaceChildren(...nodes.filter(Boolean)); status.style.marginTop = status.childElementCount ? '12px' : '0'; };
-  let tok = 0;
-  const reset = () => { free(S.src && S.src.canvas, S.before); S.file = S.src = S.an = S.before = null; S.ran = false; out.replaceChildren(); };
+  let tok = 0, running = null, again = false, timer = 0;
+  // S.gen++ tells a run still busy with the old photo to drop its result instead of showing or caching it;
+  // re-runs queued for the old photo are dropped too.
+  const reset = () => {
+    S.gen++; clearTimeout(timer); again = false;
+    free(S.src && S.src.canvas, S.before); S.file = S.src = S.an = S.before = null; S.ran = false; out.replaceChildren();
+  };
   const picker = filePicker({
     accept: 'image/*', capture: 'environment', icon: '✍️',
     label: 'Take a photo of your signature', hint: 'Dark pen · plain white paper · good light',
@@ -220,14 +267,18 @@ export async function mount(root, toolId) {
   /* ── processing ── */
   async function ensureAnalysis(p) {
     if (S.an) return S.an;
+    const gen = S.gen;
     if (p) p.set(0.15, 'Reading your photo…');
     const f = fitWithin(S.src.w, S.src.h, SIGN_WORK);
     const work = await drawHQ(S.src.canvas, f.w, f.h, { bg: '#fff' });
+    if (S.gen !== gen) { free(work); throw STALE; }
     const data = getData(work).data;
     free(work);
     if (p) p.set(0.35, 'Finding the paper and ink…');
-    S.an = await analyzeSignature(data, f.w, f.h, yielder());
-    return S.an;
+    const an = await analyzeSignature(data, f.w, f.h, yielder());
+    if (S.gen !== gen) throw STALE;
+    S.an = an;
+    return an;
   }
 
   async function render(ink) {
@@ -281,7 +332,7 @@ export async function mount(root, toolId) {
 
   async function doRun(showProgress) {
     if (!S.src) { out.replaceChildren(notice('Take or choose a photo of your signature first.', 'warn')); return; }
-    const p = showProgress ? progress('Cleaning your signature…') : null;
+    const gen = S.gen, p = showProgress ? progress('Cleaning your signature…') : null;
     if (p) out.replaceChildren(p.el);
     try {
       const an = await ensureAnalysis(p);
@@ -292,8 +343,10 @@ export async function mount(root, toolId) {
         return;
       }
       const r = await render(ink);
+      if (S.gen !== gen) return;
       if (r.error) { out.replaceChildren(notice(r.error, 'warn')); return; }
       const rc = await resultCard({ title: r.title, blob: r.blob, filename: r.filename, note: r.note, preview: 'none' });
+      if (S.gen !== gen) return;
       const before = newCanvas(S.before.width, S.before.height);
       ctxOf(before).drawImage(S.before, 0, 0);
       rc.prepend(compareStrip(before, r.blob, { checker: !!r.checker, outline: !!r.outline }));
@@ -301,18 +354,19 @@ export async function mount(root, toolId) {
       if (showProgress && rc.scrollIntoView) rc.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       S.ran = true;
     } catch (e) {
+      if (e === STALE || S.gen !== gen) return;
       console.error(e);
       out.replaceChildren(notice(errMsg(e), 'err'));
     } finally { if (p) p.done(); }
   }
 
   // One run at a time; option changes after the first result re-run automatically.
-  let running = null, again = false, timer = 0;
+  // A queued run remembers whether it came from the button (and so shows progress).
   function process(showProgress) {
-    if (running) { again = true; return running; }
+    if (running) { again = showProgress || again === 'show' ? 'show' : 'quiet'; return running; }
     running = doRun(showProgress).finally(() => {
       running = null;
-      if (again) { again = false; process(false); }
+      if (again) { const show = again === 'show'; again = false; process(show); }
     });
     return running;
   }

@@ -5,10 +5,15 @@ import * as store from '../store.js';
 
 // ═════════════════════════════ pure helpers ═════════════════════════════
 
-/** Lenient number parser: "1,00,000", "₹ 2,500.50", "18%", "−5" → number; '' or junk → NaN. */
+/** Lenient number parser: "1,00,000", "₹ 2,500.50", "18%", "−5", "12,50" (decimal comma) → number; '' or junk → NaN. */
 export function parseNum(s) {
   if (typeof s === 'number') return s;
-  let t = String(s ?? '').trim().replace(/[−–—]/g, '-').replace(/[₹$€£¥,\s%_']/g, '');
+  let t = String(s ?? '').trim().replace(/[−–—]/g, '-').replace(/[₹$€£¥\s%_']/g, '');
+  // Comma-decimal keypads (much of Europe, Indonesia, Brazil…) type "12,50". Grouping always ends in 3 digits,
+  // so one comma with 1 or 2 digits after it, or "0,125", is the decimal point. "1.234,56" is the same style in full.
+  if (!t.includes('.') && /^[+-]?(\d*,\d{1,2}|0,\d+)$/.test(t)) t = t.replace(',', '.');
+  else if (/^[+-]?\d{1,3}(\.\d{3})+,\d+$/.test(t)) t = t.replace(/\./g, '').replace(',', '.');
+  t = t.replace(/,/g, '');
   if (t.startsWith('+')) t = t.slice(1);
   if (!t || !/^-?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(t)) return NaN;
   return parseFloat(t);
@@ -304,6 +309,18 @@ export function crossRate(table, from, to) {
   if (from === to) return 1;
   const a = table.rates[from], b = table.rates[to];
   return a > 0 && b > 0 ? b / a : NaN;
+}
+
+/**
+ * Pick the saved table to convert from→to with. The direct table (base = from) wins unless another
+ * table that has both codes is more than 6 hours newer, judged by the provider's own date.
+ */
+export function bestTable(cache, from, to) {
+  const age = e => e.updated || e.ts || 0;
+  const all = Object.values(cache || {}).filter(e => e && e.rates && e.rates[from] > 0 && e.rates[to] > 0).sort((a, b) => age(b) - age(a));
+  const direct = all.find(e => e.base === from);
+  if (direct && all[0] && age(all[0]) - age(direct) <= 6 * 3.6e6) return direct;
+  return all[0] || null;
 }
 
 // ═════════════════════════════ UI helpers ═════════════════════════════
@@ -795,15 +812,9 @@ function mountCurrency(root) {
     finally { loading = false; if (root.isConnected) calc(); }
   }
 
-  function bestTable(from, to) {
-    const c = fxCache();
-    if (c[from] && c[from].rates[to]) return c[from];
-    return Object.values(c).filter(e => e.rates[from] && e.rates[to]).sort((a, b) => (b.ts || 0) - (a.ts || 0))[0] || null;
-  }
-
   function calc() {
     const a = val(A), from = F.value, to = T.value;
-    const tbl = bestTable(from, to);
+    const tbl = bestTable(fxCache(), from, to);
     status.replaceChildren();
     if (!tbl) {
       res.out.replaceChildren(loading ? h('div', { class: 'muted' }, 'Getting today’s rates…')

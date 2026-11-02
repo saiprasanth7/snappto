@@ -1,6 +1,6 @@
 import { CATEGORIES, CAT, TOOL, TOOLS, PASSPORT, PASSPORT_ITEMS, QUICK, search, botLink, BOT_USERNAME } from './catalog.js';
 import { GUIDES, DISCLAIMER } from './guidance.js';
-import { h, card, button, notice, toast, segmented, fmtBytes } from './ui.js';
+import { h, card, button, notice, toast, segmented, fmtBytes, announce, releasePreviews } from './ui.js';
 import { OFFLINE_PACKS, vendorUrl } from './lib.js';
 import * as store from './store.js';
 
@@ -39,13 +39,30 @@ function parentOf(hash) {
   if (hash === '#/privacy') return '#/more';
   return '#/';
 }
-const stack = [];
-let mountToken = 0;
+// Each history entry the app shows keeps its in-app depth in history.state (0 = the
+// first app page in this tab), which survives reloads. Back steps through history only
+// when an app page is behind it; otherwise (a cold start on a deep link) it replaces the
+// entry with the parent page, so Back never goes dead or leaves the app.
+let depth = -1, replacing = false;
+let mountToken = 0, shown = 0;
+function trackDepth() {
+  const d = history.state?.d;
+  if (typeof d === 'number') depth = d;
+  else {
+    if (!replacing) depth += 1;
+    try { history.replaceState({ d: depth }, ''); } catch { /* Safari limits bursts of replaceState */ }
+  }
+  replacing = false;
+}
+/** Go to a page without adding a history entry (Back from a deep link, bad links). */
+function replaceRoute(hash) {
+  if (hash === location.hash) return;   // no hashchange would come to clear the flag
+  replacing = true; location.replace(hash);
+}
 
 async function render() {
   const hash = location.hash || '#/';
-  if (stack.length >= 2 && stack[stack.length - 2] === hash) stack.pop();
-  else if (stack[stack.length - 1] !== hash) stack.push(hash);
+  trackDepth();
 
   const [, fn, tab] = ROUTES.find(([re]) => re.test(hash)) || ROUTES[0];
   const arg = (hash.match(ROUTES.find(([re]) => re.test(hash))?.[0] || /$^/) || [])[1];
@@ -54,11 +71,23 @@ async function render() {
   const isRoot = ROOTS.has(hash);
   setTopbar({ back: !isRoot, title: '' });
   const token = ++mountToken;
+  // A pack tool may have saved its model while it ran, so look again on the way out.
+  if (packTool) { packTool = false; packsKnown = checkPacks(); }
+  await packsKnown;   // offline tags and counts depend on which packs are saved
+  if (token !== mountToken) return;
+  releasePreviews();
   view.replaceChildren();
   view.classList.remove('view-enter'); void view.offsetWidth; view.classList.add('view-enter');
   window.scrollTo(0, 0);
   try { await fn(arg, () => token === mountToken); }
   catch (e) { console.error(e); view.replaceChildren(notice('Something went wrong loading this page. ' + (e.message || ''), 'err')); }
+  // #view isn't a live region, so after a navigation move focus to the new heading and
+  // screen readers start reading there. Never take it from a field the page focused.
+  const focused = document.activeElement;
+  if (token === mountToken && shown++ && tab !== 'search' && (focused === view || !view.contains(focused))) {
+    const head = view.querySelector('h1') || view;
+    head.tabIndex = -1; head.focus({ preventScroll: true });
+  }
 }
 
 function setTopbar({ back, title, right }) {
@@ -72,14 +101,18 @@ function setTopbar({ back, title, right }) {
 function setTitle(t) { const el = topbar.querySelector('.title'); if (el) el.textContent = t; }
 function setRight(node) { const s = topbar.querySelectorAll('.side')[1]; if (s) s.replaceChildren(node); }
 function goBack() {
-  if (stack.length >= 2) history.back();
-  else location.replace(parentOf(location.hash || '#/'));
+  if (depth > 0) history.back();
+  else replaceRoute(parentOf(location.hash || '#/'));
 }
 addEventListener('scroll', () => topbar.classList.toggle('scrolled', scrollY > 24), { passive: true });
 
 // ── offline status ──────────────────────────────────────────────────
-let offlineReady = false;
+let offlineReady = false, updateReady = false;
 function statusPill() {
+  // A waiting update shows here, in the top bar, so it never covers the page. Tool pages
+  // keep their star in this slot, so the reload can't cost a result someone is making.
+  if (updateReady) return h('button', { class: 'update', type: 'button', title: 'A new version is ready. Tap to reload SnappTo.', onclick: () => applyUpdate(true) },
+    h('span', { class: 'pill new' }, h('span', { class: 'dot' }), 'Update'));
   if (!navigator.onLine) return h('span', { class: 'pill warn', title: 'No connection — on-device tools still work' }, h('span', { class: 'dot' }), 'Offline');
   if (offlineReady) return h('span', { class: 'pill ok', title: 'Installed for offline use' }, h('span', { class: 'dot' }), 'Offline-ready');
   return h('span', { class: 'pill' }, h('span', { class: 'dot' }), 'Online');
@@ -87,10 +120,33 @@ function statusPill() {
 const refreshPill = () => { const s = topbar.querySelectorAll('.side')[1]; if (s && s.querySelector('.pill')) s.replaceChildren(statusPill()); };
 addEventListener('online', refreshPill); addEventListener('offline', refreshPill);
 
+// ── offline packs ───────────────────────────────────────────────────
+// A tool with a `pack` (js/catalog.js) works offline only once one of its OCR or face
+// model downloads is saved, so it counts as offline only then.
+const PACKS_CACHE = 'snappto-packs-v1';   // the service worker's PACKS cache (scripts/build-sw.mjs)
+const packsReady = new Set();
+async function packCached(pack) {
+  try {
+    for (const f of pack.files) { if (!(await caches.match(vendorUrl(f)))) return false; }
+    return true;
+  } catch { return false; }
+}
+async function refreshPacks() {
+  await Promise.all(Object.entries(OFFLINE_PACKS).map(async ([key, pack]) => {
+    if (await packCached(pack)) packsReady.add(key); else packsReady.delete(key);
+  }));
+}
+// Checked before the first page and after leaving a pack tool; a slow Cache Storage
+// must not hold up the app.
+const checkPacks = () => Promise.race([refreshPacks(), new Promise(r => setTimeout(r, 400))]).catch(() => {});
+let packsKnown = checkPacks(), packTool = false;
+const needsPack = t => t.where === 'device' && !!t.pack && !t.pack.some(k => packsReady.has(k));
+const worksOffline = t => t.where === 'device' && !needsPack(t);
+
 // ── reusable list pieces ────────────────────────────────────────────
-const WHERE = { device: ['Offline', 'device'], online: ['Online', 'online'], bot: ['Telegram', 'bot'], soon: ['Soon', 'online'] };
+const WHERE = { device: ['Offline', 'device'], pack: ['Download', 'online'], online: ['Online', 'online'], bot: ['Telegram', 'bot'], soon: ['Soon', 'online'] };
 function toolItem(t) {
-  const [lbl, cls] = WHERE[t.where] || WHERE.device;
+  const [lbl, cls] = WHERE[needsPack(t) ? 'pack' : t.where] || WHERE.device;
   return h('a', { class: 'item', href: `#/tool/${t.id}` },
     h('span', { class: `ic hue-${t.cat}` }, t.emoji),
     h('span', { class: 'txt' }, h('div', { class: 't' }, t.label), h('div', { class: 'd' }, t.desc)),
@@ -107,7 +163,7 @@ const logoImg = () => h('img', { src: 'assets/logo-mark.svg', alt: '' });
 
 // ── pages ───────────────────────────────────────────────────────────
 function home() {
-  const deviceCount = TOOLS.filter(t => t.where === 'device').length;
+  const deviceCount = TOOLS.filter(worksOffline).length;
   view.append(
     h('div', { class: 'hero' },
       h('div', { class: 'brandrow' }, h('div', { class: 'logo' }, logoImg()),
@@ -136,10 +192,10 @@ function home() {
 }
 
 function toolsPage() {
-  const off = TOOLS.filter(t => t.where === 'device').length;
+  const off = TOOLS.filter(worksOffline).length, later = TOOLS.filter(needsPack).length;
   setTitle('Tools');
   view.append(h('h1', { class: 'large-title' }, 'Tools'),
-    h('p', { class: 'subtitle' }, `${TOOLS.length} tools · ${off} work fully offline`),
+    h('p', { class: 'subtitle' }, `${TOOLS.length} tools · ${off} work fully offline${later ? `, ${later} more after a one-time download` : ''}`),
     h('div', { class: 'tiles' }, CATEGORIES.map(c =>
       h('a', { class: 'tile', href: `#/cat/${c.id}` },
         h('div', { class: `icon hue-${c.id}` }, c.emoji),
@@ -149,9 +205,9 @@ function toolsPage() {
 
 function categoryPage(id) {
   const c = CAT[id];
-  if (!c) return void (location.hash = '#/tools');
+  if (!c) return void replaceRoute('#/tools');
   setTitle(c.title);
-  const off = c.tools.filter(t => t.where === 'device').length;
+  const off = c.tools.filter(worksOffline).length;
   view.append(h('h1', { class: 'large-title' }, `${c.emoji} ${c.title}`),
     h('p', { class: 'subtitle' }, `${c.tools.length} tools${off ? ` · ${off} offline` : ''}`),
     h('div', { class: 'group' }, c.tools.map(t => toolItem({ ...t, cat: c.id, emoji: c.emoji }))));
@@ -159,13 +215,14 @@ function categoryPage(id) {
 
 async function toolPage(id, alive) {
   const t = TOOL[id];
-  if (!t) return void (location.hash = '#/tools');
+  if (!t) return void replaceRoute('#/tools');
   setTitle(t.label);
   const fav = h('button', { class: 'back', 'aria-label': 'Favorite', style: { color: 'var(--accent)' } });
   const paint = () => { fav.innerHTML = I.star(store.isFav(id)); };
   fav.onclick = () => { const on = store.toggleFav(id); paint(); toast(on ? 'Added to Favorites' : 'Removed from Favorites'); };
   paint(); setRight(fav);
   store.pushRecent(id);
+  packTool = !!t.pack;
   view.append(h('h1', { class: 'large-title' }, t.label), h('p', { class: 'subtitle' }, t.desc));
 
   if (t.where === 'bot' || !t.module) {
@@ -190,6 +247,7 @@ async function toolPage(id, alive) {
     root.replaceChildren(notice(navigator.onLine
       ? `This tool failed to load: ${e.message || e}`
       : 'This tool isn’t downloaded for offline use yet. Open it once while online.', 'err'));
+    if (navigator.onLine) root.append(h('div', { style: { marginTop: '12px' } }, button('Reload SnappTo', () => location.reload(), { variant: 'secondary', full: true })));
   }
 }
 
@@ -206,7 +264,7 @@ function passportPage() {
 
 function guidePage(id) {
   const g = GUIDES[id];
-  if (!g) return void (location.hash = '#/passport');
+  if (!g) return void replaceRoute('#/passport');
   setTitle(g.title);
   const p = PASSPORT_ITEMS.find(x => x.id === id);
   view.append(h('h1', { class: 'large-title' }, `${p ? p.emoji + ' ' : ''}${g.title}`),
@@ -223,12 +281,16 @@ function searchPage() {
   view.append(h('h1', { class: 'large-title' }, 'Search'));
   const results = h('div');
   const input = h('input', { type: 'search', placeholder: 'Try “compress pdf”, “passport”, “emi”…', autocomplete: 'off', enterkeyhint: 'search' });
+  let said;
   const draw = () => {
     const r = search(input.value);
+    clearTimeout(said);
     if (!input.value.trim()) {
       results.replaceChildren(label('Popular'), h('div', { class: 'group' }, QUICK.map(id => TOOL[id]).filter(Boolean).map(toolItem)));
       return;
     }
+    // The list isn't read out as it changes; say how many matched once typing pauses.
+    said = setTimeout(() => announce(r.length ? `${r.length} result${r.length === 1 ? '' : 's'}` : 'No matches'), 700);
     if (!r.length) { results.replaceChildren(h('div', { class: 'empty' }, h('div', { class: 'e' }, '🔍'), 'No matches. Try a simpler word like “pdf” or “photo”.')); return; }
     results.replaceChildren(h('div', { class: 'group' }, r.map(x => x.kind === 'tool' ? toolItem(x.item) : passportItem(x.item))));
   };
@@ -264,10 +326,26 @@ async function morePage() {
       if (!navigator.onLine) return toast('Connect to the internet to download', 'err');
       btn.disabled = true; const d = it.querySelector('.d');
       let done = 0;
+      d.textContent = `0/${pack.files.length} files`;
       try {
-        for (const f of pack.files) { await fetch(vendorUrl(f), { cache: 'reload' }); d.textContent = `${++done}/${pack.files.length} files`; }
-        await setState(); d.textContent = 'Ready offline'; toast('Saved for offline use', 'ok');
-      } catch { d.textContent = 'Download failed — try again'; }
+        // Store each file from here and wait for the write, so "Saved" only shows once
+        // every file really is in Cache Storage, and a failed file is reported.
+        const c = await caches.open(PACKS_CACHE);
+        for (const f of pack.files) {
+          const u = vendorUrl(f);
+          const r = await fetch(u, { cache: 'reload' });
+          if (!r.ok) throw new Error(`${f}: HTTP ${r.status}`);
+          await c.put(u, r);
+          d.textContent = `${++done}/${pack.files.length} files`;
+        }
+        if (!(await packCached(pack))) throw new Error('files missing from Cache Storage');
+        d.textContent = 'Ready offline'; toast('Saved for offline use', 'ok');
+      } catch (e) {
+        console.warn('Offline download failed', e);
+        d.textContent = 'Download didn’t finish. Check your connection and try again.';
+        toast('Download didn’t finish', 'err');
+      }
+      await refreshPacks(); await setState();
       btn.disabled = false;
     };
     setState();
@@ -287,24 +365,29 @@ async function morePage() {
       h('span', { class: 'txt' }, h('div', { class: 't' }, 'Privacy'), h('div', { class: 'd' }, 'Your files never leave your phone')), svg(I.chev)),
     h('button', { class: 'item', onclick: () => { store.set('recent', []); store.set('favs', []); toast('Cleared', 'ok'); } },
       h('span', { class: 'ic', style: { background: '#94A3B8' } }, '🧹'),
-      h('span', { class: 'txt' }, h('div', { class: 't' }, 'Clear favorites & recent'), h('div', { class: 'd' }, 'Stored only on this device')))));
+      h('span', { class: 'txt' }, h('div', { class: 't' }, 'Clear favorites & recent'), h('div', { class: 'd' }, 'Stored only on this device'))),
+    h('button', { class: 'item', onclick: clearSaved },
+      h('span', { class: 'ic', style: { background: '#94A3B8' } }, '🗑'),
+      h('span', { class: 'txt' }, h('div', { class: 't' }, 'Clear saved data'), h('div', { class: 'd' }, 'UPI ID, calculator inputs, checklists, settings')))));
   const usage = navigator.storage?.estimate ? await navigator.storage.estimate().catch(() => null) : null;
   view.append(h('p', { class: 'faint small', style: { margin: '18px 6px', textAlign: 'center' } },
     `SnappTo ${VERSION}${usage ? ` · ${fmtBytes(usage.usage)} saved on this device` : ''}`, h('br'),
     'Built with open-source libraries: pdf-lib, PDF.js, Tesseract.js, MediaPipe, jsQR, JsBarcode, fflate.'));
 }
 
-async function packCached(pack) {
-  if (!('caches' in window)) return false;
-  for (const f of pack.files) { if (!(await caches.match(vendorUrl(f)))) return false; }
-  return true;
+function clearSaved() {
+  if (!confirm('Delete everything SnappTo saved on this device? This removes your UPI ID and name, calculator inputs, checklists, favorites, recent tools and settings. Downloads for offline use are kept.')) return;
+  store.clearAll(); applyTheme();
+  toast('Saved data cleared', 'ok');
+  render();
 }
 
 function privacyPage() {
   setTitle('Privacy');
   view.append(h('h1', { class: 'large-title' }, 'Privacy'), h('div', { class: 'card prose', html: `
     <p><b>Your files stay on your phone.</b> Every tool marked <b>Offline</b> runs entirely inside your browser. Photos, PDFs, signatures and documents are never uploaded to any server.</p>
-    <p><b>No accounts, no tracking.</b> SnappTo has no sign-in, no analytics and no ads. Favorites, recent tools and your theme choice are saved only in this browser’s local storage, and you can clear them any time from More.</p>
+    <p><b>No accounts, no tracking.</b> SnappTo has no sign-in, no analytics and no ads.</p>
+    <p><b>What stays on your phone.</b> To save you typing, SnappTo keeps a few things in this browser’s local storage: favorites, recent tools, your theme, the UPI ID and name you used for a UPI QR, calculator and converter inputs, your checklists, tool settings and the last exchange rates. None of it is sent anywhere. Remove it any time with More ▸ Clear saved data.</p>
     <p><b>Internet use.</b> The currency converter fetches public exchange rates. Tools marked <b>Telegram</b> open the SnappTo Telegram bot; files you send there are processed on our server and deleted about a minute later.</p>
     <p><b>Passport guidance</b> is general information with links to official government portals. SnappTo is not a government service and cannot approve, speed up or submit applications.</p>
     <p class="faint">Last updated October 2026.</p>` }));
@@ -339,20 +422,44 @@ function applyTheme() {
 }
 
 // ── service worker ──────────────────────────────────────────────────
+// A new version installs in the background and waits, and this page keeps running the
+// version it started with. The new one takes over only together with a reload: when
+// the user taps Update in the top bar, or right away when the app starts with one
+// already waiting. So a page never runs old shell modules with new tool modules.
+let swReg = null, swTapped = false;
+function applyUpdate(tapped) {
+  swTapped = tapped;
+  if (swReg?.waiting) swReg.waiting.postMessage('skipWaiting');
+  else location.reload();
+}
+function offerUpdate() {
+  if (!navigator.serviceWorker.controller || updateReady) return;
+  updateReady = true; refreshPill();
+}
 async function registerSW() {
   if (!('serviceWorker' in navigator)) return;
+  const sw = navigator.serviceWorker;
+  let controlled = !!sw.controller, reloading = false;
+  const ready = () => { offlineReady = true; refreshPill(); };
+  if (controlled) ready();
+  sw.addEventListener('controllerchange', () => {
+    // First install: this page came from the network and the new cache holds the same files.
+    if (!controlled) { controlled = true; ready(); return; }
+    if (!reloading) { reloading = true; location.reload(); }
+  });
+  sw.addEventListener('message', e => {
+    if (e.data === 'precached') ready();
+    if (e.data === 'other-tabs-open') {   // the worker waits while another tab runs the old version
+      offerUpdate();
+      if (swTapped) toast('Close your other SnappTo tabs, then tap Update again', 'err');
+    }
+  });
   try {
-    const reg = await navigator.serviceWorker.register('./sw.js');
-    const ready = () => { offlineReady = true; refreshPill(); };
-    if (navigator.serviceWorker.controller) ready();
-    navigator.serviceWorker.addEventListener('controllerchange', ready);
-    navigator.serviceWorker.addEventListener('message', e => { if (e.data === 'precached') ready(); });
-    reg.addEventListener('updatefound', () => {
-      const nw = reg.installing;
-      nw && nw.addEventListener('statechange', () => {
-        if (nw.state === 'installed' && navigator.serviceWorker.controller) toast('SnappTo updated — reopen to use the new version', 'ok');
-      });
-    });
+    swReg = await sw.register('./sw.js');
+    const watch = w => w && w.addEventListener('statechange', () => { if (w.state === 'installed') offerUpdate(); });
+    if (swReg.waiting && sw.controller) applyUpdate(false);   // cold start: nothing is in use yet
+    watch(swReg.installing);
+    swReg.addEventListener('updatefound', () => watch(swReg.installing));
   } catch (e) { console.warn('SW registration failed', e); }
 }
 

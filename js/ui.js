@@ -152,32 +152,55 @@ export function notice(content, kind = 'info') {
 /** Progress bar. set(fraction 0..1 or null for indeterminate, label). */
 export function progress(label = 'Working…') {
   const fill = h('div', { class: 'fill' });
-  const pct = h('span', { class: 'faint' });
-  const lab = h('span', {}, label);
-  const el = h('div', { class: 'prog indet' }, h('div', { class: 'pl' }, lab, pct), h('div', { class: 'bar' }, fill));
+  // Only the stage label is live, so screen readers hear "Reading page 3" but not
+  // every percent tick; the bar's value is there when they ask for it.
+  const pct = h('span', { class: 'faint', 'aria-hidden': 'true' });
+  const lab = h('span', { role: 'status' }, label);
+  const bar = h('div', { class: 'bar', role: 'progressbar', 'aria-label': label }, fill);
+  const el = h('div', { class: 'prog indet' }, h('div', { class: 'pl' }, lab, pct), bar);
   return {
     el,
     set(frac, text) {
-      if (text) lab.textContent = text;
-      if (frac == null) { el.classList.add('indet'); pct.textContent = ''; fill.style.width = ''; }
-      else { el.classList.remove('indet'); const p = Math.max(0, Math.min(1, frac)); fill.style.width = (p * 100).toFixed(1) + '%'; pct.textContent = Math.round(p * 100) + '%'; }
+      if (text && text !== lab.textContent) { lab.textContent = text; bar.setAttribute('aria-label', text); }
+      if (frac == null) { el.classList.add('indet'); pct.textContent = ''; fill.style.width = ''; bar.removeAttribute('aria-valuenow'); }
+      else {
+        el.classList.remove('indet'); const p = Math.max(0, Math.min(1, frac));
+        fill.style.width = (p * 100).toFixed(1) + '%'; pct.textContent = Math.round(p * 100) + '%'; bar.setAttribute('aria-valuenow', Math.round(p * 100));
+      }
     },
     done() { el.remove(); },
-    fail(msg) { el.replaceWith(notice(msg, 'err')); },
+    fail(msg) { el.replaceWith(notice(msg, 'err')); announce(typeof msg === 'string' ? msg : msg?.textContent); },
   };
+}
+
+// A preview URL pins its whole blob in memory until it's revoked. The shell frees
+// every preview when you leave a page (releasePreviews), a preview that can never be
+// shown again frees itself once the browser collects it, and a tool can free one
+// early with card.dispose() or by passing its UrlBag as `bag`.
+const previewUrls = new Set();
+const previewGone = typeof FinalizationRegistry === 'function'
+  ? new FinalizationRegistry(url => { URL.revokeObjectURL(url); previewUrls.delete(url); }) : null;
+export function releasePreviews() {
+  for (const u of previewUrls) URL.revokeObjectURL(u);
+  previewUrls.clear();
 }
 
 /**
  * The standard "here's your file" card: preview, size change, Download + Share.
- * resultCard({title, blob, filename, before, after, note, preview:'auto'|'image'|'none'})
+ * resultCard({title, blob, filename, before, after, note, preview:'auto'|'image'|'none', bag})
+ * `bag` (optional, a UrlBag) also revokes the preview when the bag is cleared.
  */
-export async function resultCard({ title = 'Done', blob, filename = 'output', before, after, note, preview = 'auto' } = {}) {
+export async function resultCard({ title = 'Done', blob, filename = 'output', before, after, note, preview = 'auto', bag } = {}) {
   const size = after ?? blob?.size;
   const isImg = blob && /^image\//.test(blob.type);
   const box = h('div', { class: 'result' });
+  box.dispose = () => {};
   if (blob && (preview === 'image' || (preview === 'auto' && isImg))) {
-    const url = URL.createObjectURL(blob);
+    const url = bag ? bag.add(blob) : URL.createObjectURL(blob);
     const img = h('img', { src: url, alt: 'Result preview' });
+    previewUrls.add(url);
+    previewGone?.register(img, url);
+    box.dispose = () => { URL.revokeObjectURL(url); previewUrls.delete(url); };
     const rp = h('div', { class: 'rp' + (blob.type === 'image/png' || blob.type === 'image/webp' ? ' checker' : '') }, img);
     box.append(rp);
   }
@@ -195,6 +218,7 @@ export async function resultCard({ title = 'Done', blob, filename = 'output', be
     blob && h('div', { class: 'acts' },
       button('Download', () => download(blob, filename), { variant: 'primary' }),
       canShareFiles() && button('Share', () => share(blob, filename), { variant: 'secondary' }))));
+  announce(title);
   return box;
 }
 
@@ -219,9 +243,29 @@ export async function share(blob, filename, title = filename) {
   download(blob, filename);
 }
 
-let toastHost;
+// Live regions are made when the app starts, not with their first message: TalkBack with
+// Chrome and NVDA often skip text that arrives together with its region.
+let srHost, toastHost;
+function liveRegions() {
+  if (srHost) return;
+  srHost = h('div', { class: 'sr-only', role: 'status', 'aria-live': 'polite' });
+  toastHost = h('div', { class: 'toasts', 'aria-live': 'polite' });
+  document.body.append(srHost, toastHost);
+}
+if (typeof document !== 'undefined' && document.body) liveRegions();
+
+/** Tell screen readers about a change without showing anything, e.g. announce('3 results'). */
+export function announce(msg) {
+  if (!msg) return;
+  liveRegions();
+  if ([...srHost.children].some(c => c.textContent === msg)) return;   // a batch of "Done" cards says it once
+  const m = h('div', {}, msg);
+  srHost.append(m);
+  setTimeout(() => m.remove(), 4000);
+}
+
 export function toast(msg, kind = '') {
-  if (!toastHost) { toastHost = h('div', { class: 'toasts', 'aria-live': 'polite' }); document.body.append(toastHost); }
+  liveRegions();
   const t = h('div', { class: `toast ${kind}` }, msg);
   toastHost.append(t);
   setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity .3s'; setTimeout(() => t.remove(), 320); }, 2600);
@@ -306,7 +350,11 @@ export function canvasToBlob(canvas, type = 'image/jpeg', quality = 0.92) {
 /** Encode JPEG under a size cap by stepping quality down. Returns the Blob. */
 export async function jpegUnder(canvas, maxBytes, { start = 0.95, floor = 0.35, step = 0.05 } = {}) {
   let q = start, b = await canvasToBlob(canvas, 'image/jpeg', q);
-  while (b.size > maxBytes && q - step >= floor) { q -= step; b = await canvasToBlob(canvas, 'image/jpeg', q); }
+  // Rounded steps: plain q -= step drifts and stopped one step above the floor.
+  while (b.size > maxBytes && q > floor + 1e-9) {
+    q = Math.max(floor, Math.round((q - step) * 1000) / 1000);
+    b = await canvasToBlob(canvas, 'image/jpeg', q);
+  }
   return b;
 }
 

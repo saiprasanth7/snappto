@@ -6,10 +6,13 @@
 //   'online' → runs on the phone but needs internet (e.g. live currency rates)
 //   'bot'    → needs server software; opens the Telegram bot with that tool
 //   'soon'   → on the roadmap
+// pack: keys of OFFLINE_PACKS (js/lib.js) for a 'device' tool that works offline only
+//   once one of them is saved (OCR and face/background models are not part of the app
+//   download). Any one is enough: Read Hindi / Telugu works with either language.
 export const BOT_USERNAME = 'Snappto_bot';
 export const botLink = id => `https://t.me/${BOT_USERNAME}?start=${encodeURIComponent(id)}`;
 
-const T = (id, label, desc, where, module) => ({ id, label, desc, where, module });
+const T = (id, label, desc, where, module, pack) => ({ id, label, desc, where, module, pack });
 
 export const CATEGORIES = [
   { id: 'docs', emoji: '📄', title: 'Documents', tools: [
@@ -23,24 +26,24 @@ export const CATEGORIES = [
     T('pagenumbers', 'Add page numbers', 'Number every page', 'device', 'pdf.js'),
     T('watermark', 'Add watermark', 'Stamp text across every page', 'device', 'pdf.js'),
     T('pdftext', 'PDF → Text', 'Pull the text out of a PDF', 'device', 'pdf.js'),
-    T('ocr', 'Scan → searchable text', 'Read text from scanned PDFs', 'device', 'ocr.js'),
+    T('ocr', 'Scan → searchable text', 'Read text from scanned PDFs', 'device', 'ocr.js', ['ocr_eng']),
     T('pdf2docx', 'PDF → Word', 'Editable .docx (via Telegram bot)', 'bot'),
     T('office2pdf', 'Word / PPT / Excel → PDF', 'Office files to PDF (via Telegram bot)', 'bot'),
     T('lock', 'Lock PDF', 'Add a password (via Telegram bot)', 'bot'),
     T('unlock', 'Unlock PDF', 'Remove a password you know (via Telegram bot)', 'bot'),
   ]},
   { id: 'img', emoji: '🖼', title: 'Images', tools: [
-    T('removebg', 'Remove background', 'Cut out people — transparent PNG', 'device', 'image.js'),
+    T('removebg', 'Remove background', 'Cut out people — transparent PNG', 'device', 'image.js', ['vision']),
     T('imgcompress', 'Compress image', 'Hit a size limit (e.g. under 200 KB)', 'device', 'image.js'),
     T('resize', 'Resize image', 'Exact pixels or percentage', 'device', 'image.js'),
     T('crop', 'Crop image', 'Free or fixed ratio crop', 'device', 'image.js'),
     T('imgrotate', 'Rotate / flip', 'Turn or mirror a photo', 'device', 'image.js'),
     T('convert_img', 'Convert format', 'JPG ⇄ PNG ⇄ WebP', 'device', 'image.js'),
     T('enhance', 'Enhance & sharpen', 'Upscale 2× and sharpen', 'device', 'image.js'),
-    T('blurbg', 'Blur background', 'Portrait-mode style blur', 'device', 'image.js'),
+    T('blurbg', 'Blur background', 'Portrait-mode style blur', 'device', 'image.js', ['vision']),
     T('stripmeta', 'Remove photo metadata', 'Strip location & camera info', 'device', 'image.js'),
-    T('imgocr', 'Extract text from image', 'Copy text out of a photo', 'device', 'ocr.js'),
-    T('passportphoto', 'Passport photo maker', 'Compliant photo + print sheet', 'device', 'passport.js'),
+    T('imgocr', 'Extract text from image', 'Copy text out of a photo', 'device', 'ocr.js', ['ocr_eng']),
+    T('passportphoto', 'Passport photo maker', 'Compliant photo + print sheet', 'device', 'passport.js', ['vision']),
     T('restore', 'AI restore old photo', 'Face restore + 4K (via Telegram bot)', 'bot'),
   ]},
   { id: 'sign', emoji: '🖋', title: 'Signature', tools: [
@@ -79,7 +82,7 @@ export const CATEGORIES = [
   ]},
   { id: 'lang', emoji: '🌐', title: 'Language', tools: [
     T('translate', 'Translate text', 'Any language (via Telegram bot)', 'bot'),
-    T('imgocr_lang', 'Read Hindi / Telugu text', 'Text from photos in Indian scripts', 'device', 'ocr.js'),
+    T('imgocr_lang', 'Read Hindi / Telugu text', 'Text from photos in Indian scripts', 'device', 'ocr.js', ['ocr_hin', 'ocr_tel']),
     T('tts_lang', 'Pronounce text', 'Hear it spoken', 'device', 'text.js'),
   ]},
   { id: 'qr', emoji: '🔳', title: 'QR & Barcode', tools: [
@@ -108,7 +111,7 @@ export const CATEGORIES = [
     T('filetype', 'What is this file?', 'Detect the real file type', 'device', 'file.js'),
   ]},
   { id: 'career', emoji: '🎓', title: 'Student & Career', tools: [
-    T('examphoto', 'Exam photo & signature', 'SSC, UPSC, NEET, JEE specs', 'device', 'passport.js'),
+    T('examphoto', 'Exam photo & signature', 'SSC, UPSC, NEET, JEE specs', 'device', 'passport.js', ['vision']),
     T('signexam2', 'Exam signature resizer', 'Exact KB & pixels', 'device', 'signature.js'),
     T('resume', 'Resume draft', 'From your details (via Telegram bot)', 'bot'),
     T('sop', 'SOP writer', 'Statement of purpose (via Telegram bot)', 'bot'),
@@ -155,8 +158,9 @@ export const PASSPORT = [
 ];
 
 export const TOOLS = CATEGORIES.flatMap(c => c.tools.map(t => ({ ...t, cat: c.id, catTitle: c.title, emoji: c.emoji })));
-export const TOOL = Object.fromEntries(TOOLS.map(t => [t.id, t]));
-export const CAT = Object.fromEntries(CATEGORIES.map(c => [c.id, c]));
+// No prototype, so ids from the URL like 'constructor' or '__proto__' find nothing.
+export const TOOL = Object.assign(Object.create(null), Object.fromEntries(TOOLS.map(t => [t.id, t])));
+export const CAT = Object.assign(Object.create(null), Object.fromEntries(CATEGORIES.map(c => [c.id, c])));
 export const PASSPORT_ITEMS = PASSPORT.flatMap(s => s.items.map(([id, e, t, d]) => ({ id, emoji: e, title: t, desc: d })));
 
 const SYN = {
@@ -166,24 +170,38 @@ const SYN = {
   'emi': 'emi', 'loan': 'emi', 'gst': 'gst', 'tax': 'gst', 'age': 'age', 'currency': 'currency',
   'usd': 'currency', 'inr': 'currency', 'dollar': 'currency', 'ocr': 'imgocr', 'text from': 'imgocr',
   'signature': 'signclean', 'sign': 'signclean', 'resize': 'resize', 'kb': 'imgcompress',
-  'compress image': 'imgcompress', 'zip': 'zip', 'password': 'password', 'word count': 'wordcount',
+  'compress image': 'imgcompress', 'zip': 'zip', 'unzip': 'unzip', 'esign': 'signclean',
+  'password': 'password', 'word count': 'wordcount', 'word to pdf': 'office2pdf', 'ppt to pdf': 'office2pdf', 'excel to pdf': 'office2pdf',
+  'image to pdf': 'img2pdf', 'images to pdf': 'img2pdf', 'photo to pdf': 'img2pdf', 'jpg to pdf': 'img2pdf',
+  'pdf to text': 'pdftext', 'text from pdf': 'ocr', 'scanned pdf': 'ocr',
 };
 
 /** Ranked search across tools and passport services. */
 export function search(q) {
-  q = (q || '').toLowerCase().trim();
+  q = (q || '').toLowerCase().replace(/→/g, ' to ').trim();   // a pasted 'PDF → Word' too
   if (!q) return [];
   const words = q.split(/\s+/).filter(Boolean);
+  q = words.join(' ');
   const scored = [];
-  const syn = Object.entries(SYN).filter(([k]) => q.includes(k)).map(([, v]) => v);
+  // A phrase synonym is specific, so it outranks loose word hits: 'pdf to word' must not
+  // list Word → PDF first. A one-word synonym ('photo', 'scan') only nudges, or it would
+  // beat a tool that matches every word. It matches at the start of a word, so 'age'
+  // doesn't fire inside 'image' but 'signatures' and '20kb' still count.
+  const padded = ` ${q} `, stems = q.split(/[^\p{L}\p{N}]+/u).map(w => w.replace(/^\d+/, ''));
+  const syn = new Map();
+  for (const [k, id] of Object.entries(SYN)) {
+    const bonus = k.includes(' ') ? padded.includes(` ${k} `) && 10 : stems.some(w => w.startsWith(k)) && 3;
+    if (bonus) syn.set(id, Math.max(syn.get(id) || 0, bonus));
+  }
   for (const t of TOOLS) {
-    const hay = `${t.label} ${t.desc} ${t.catTitle}`.toLowerCase();
+    const label = t.label.toLowerCase().replace(/→/g, 'to');   // 'PDF → Word' reads as 'pdf to word'
+    const hay = `${label} ${t.desc} ${t.catTitle}`.toLowerCase();
     let s = 0;
-    if (t.label.toLowerCase().startsWith(q)) s += 6;
+    if (label.startsWith(q)) s += 6;
     if (hay.includes(q)) s += 4;
     const hits = words.filter(w => hay.includes(w)).length;
     s += hits + (words.length > 1 && hits === words.length ? 4 : 0);
-    if (syn.includes(t.id)) s += 3;
+    s += syn.get(t.id) || 0;
     if (s > 0 && t.where === 'device') s += 0.5;
     if (s > 0) scored.push({ kind: 'tool', item: t, s });
   }

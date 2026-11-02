@@ -33,8 +33,9 @@ export async function mount(root, toolId) {
 /* ───────────────────────── shared scaffolding ───────────────────────── */
 
 function photoState() {
-  const S = { file: null, src: null, before: null, matte: null, bag: new UrlBag() };
+  const S = { file: null, src: null, before: null, matte: null, gen: 0, bag: new UrlBag() };
   S.reset = () => {
+    S.gen++;                 // a run still busy with the old photo sees this and drops its result
     S.bag.clear();
     free(S.src && S.src.canvas, S.before, S.matte && S.matte.work);
     S.file = S.src = S.before = S.matte = null;
@@ -86,23 +87,33 @@ function describeSrc(file, src) {
   return `${src.origW} × ${src.origH} px · ${fmtBytes(file.size)}` +
     (src.scaled ? ` · working at ${src.w} × ${src.h} (browser limit)` : '');
 }
+/** Result-note sentence for photos that were scaled down on load (empty otherwise). */
+const capNote = src => src.scaled && `The original ${src.origW} × ${src.origH} photo was larger than your browser can handle, so it was scaled to about 16 MP first`;
 
-/** Wrap a tool's work: clears old results, shows progress, catches every error. */
+/** Thrown when a new photo is picked mid-run; runner() drops it quietly. */
+const STALE = new Error('stale');
+
+/**
+ * Wrap a tool's work: clears old results, shows progress, catches every error.
+ * If a new photo is picked while it runs, the old photo's result (or error) is dropped.
+ */
 function runner(S, out) {
   return (btn, work) => busy(btn, async () => {
     out.replaceChildren();
     S.bag.clear();
     if (!S.src) { out.append(notice('Choose a photo first.', 'warn')); return; }
-    const p = progress('Working…');
+    const gen = S.gen, p = progress('Working…');
     out.append(p.el);
     try {
       const nodes = [].concat(await work(p)).filter(Boolean);
       p.done();
+      if (S.gen !== gen) return;
       out.append(...nodes);
       if (nodes[0] && nodes[0].scrollIntoView) nodes[0].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     } catch (e) {
-      console.error(e);
       p.done();
+      if (e === STALE || S.gen !== gen) return;
+      console.error(e);
       out.append(notice(errMsg(e), 'err'));
     }
   });
@@ -126,9 +137,11 @@ const yieldWith = (p, a, b) => {
  * Soft person matte at working size: MediaPipe selfie segmenter on a ≤1024 px
  * copy, then a guided filter so the edge follows the real outline at full size.
  * Cached on S until a new photo is picked. → {work, W, H, q: Float32Array 0..1}
+ * Throws STALE (and caches nothing) if a new photo is picked while it works.
  */
 async function getMatte(S, p, maxSide) {
   if (S.matte) return S.matte;
+  const src = S.src, gen = S.gen;
   p.set(null, 'Loading the cut-out model…');
   let seg;
   try { seg = await personSegmenter(); }
@@ -138,12 +151,14 @@ async function getMatte(S, p, maxSide) {
       ? 'Couldn’t start the cut-out model on this device. Close other tabs and try again.'
       : 'The cut-out model isn’t saved on this phone yet. Open this tool once while online, or download “Face detection & background removal” under More ▸ Use offline.');
   }
-  const f = fitWithin(S.src.w, S.src.h, maxSide);
+  if (S.gen !== gen) throw STALE;
+  const f = fitWithin(src.w, src.h, maxSide);
   const W = f.w, H = f.h;
   p.set(0.15, 'Finding the person…');
-  const work = await drawHQ(S.src.canvas, W, H, { bg: '#fff' });
+  const work = await drawHQ(src.canvas, W, H, { bg: '#fff' });
   const g = fitWithin(W, H, WORK.guide);
   const guide = await drawHQ(work, g.w, g.h);
+  if (S.gen !== gen) { free(work, guide); throw STALE; }
   let mask, mw, mh;
   const res = seg.segment(guide);
   try {
@@ -159,12 +174,17 @@ async function getMatte(S, p, maxSide) {
   if (mw !== g.w || mh !== g.h) mask = resamplePlane(mask, mw, mh, g.w, g.h);
 
   p.set(0.35, 'Refining the edges…');
-  const y = yieldWith(p, 0.35, 0.65);
+  const y0 = yieldWith(p, 0.35, 0.65);
+  const y = async () => { await y0(); if (S.gen !== gen) throw STALE; };   // stop soon after a new photo is picked
   const I = lumaPlane(getData(guide).data, g.w * g.h);
   free(guide);
   const r = Math.max(4, Math.round(Math.max(g.w, g.h) / 90));
-  const { A, B } = await guidedAB(I, mask, g.w, g.h, r, 3e-3, y);
-  const q = await guidedUpsample(A, B, g.w, g.h, getData(work).data, W, H, y);
+  let q;
+  try {
+    const { A, B } = await guidedAB(I, mask, g.w, g.h, r, 3e-3, y);
+    q = await guidedUpsample(A, B, g.w, g.h, getData(work).data, W, H, y);
+    if (S.gen !== gen) throw STALE;
+  } catch (e) { free(work); throw e; }
   S.matte = { work, W, H, q };
   return S.matte;
 }
@@ -336,7 +356,7 @@ async function compressImage(root) {
         const blob = await canvasToBlob(base, 'image/jpeg', q);
         const rc = await resultCard({
           title: 'Compressed', blob, filename: outName(file, 'compressed', 'jpg'), before: file.size,
-          note: `${src.w} × ${src.h} px · quality ${quality.value}%${blob.size >= file.size ? ' — bigger than the original, try a lower quality' : ''}`,
+          note: [`${src.w} × ${src.h} px · quality ${quality.value}%${blob.size >= file.size ? ' — bigger than the original, try a lower quality' : ''}`, capNote(src)].filter(Boolean).join('. '),
         });
         return addBeforeAfter(rc, S.before, S.bag);
       }
@@ -345,7 +365,7 @@ async function compressImage(root) {
       const target = Math.round(kb * KB), label = kb >= 1000 && kb % 1000 === 0 ? `${kb / 1000} MB` : `${kb} KB`;
       if (file.size <= target && /jpe?g/i.test(file.type)) {
         return [notice(`Your photo is already ${fmtBytes(file.size)} — under ${label}. No need to shrink it.`, 'ok'),
-          await resultCard({ title: 'Already small enough', blob: file, filename: file.name, note: `${src.w} × ${src.h} px` })];
+          await resultCard({ title: 'Already small enough', blob: file, filename: file.name, note: `${src.origW} × ${src.origH} px` })];
       }
       const FLOOR = 0.4;
       let scale = 1, cur = base, w = src.w, h0 = src.h, blob = null;
@@ -369,7 +389,8 @@ async function compressImage(root) {
       const resized = w !== src.w || h0 !== src.h;
       const rc = await resultCard({
         title: `Under ${label} ✓`, blob, filename: outName(file, 'compressed', 'jpg'), before: file.size,
-        note: resized ? `Resized ${src.w} × ${src.h} → ${w} × ${h0} px to reach the limit` : `${w} × ${h0} px — same size, lower file weight`,
+        note: [resized ? `Resized ${src.w} × ${src.h} → ${w} × ${h0} px to reach the limit` : `${w} × ${h0} px${src.scaled ? '' : ' · same size, lower file weight'}`,
+          capNote(src)].filter(Boolean).join('. '),
       });
       return addBeforeAfter(rc, S.before, S.bag);
     } finally { if (base !== src.canvas) free(base); }
@@ -555,7 +576,7 @@ async function cropImage(root) {
     free(c);
     return resultCard({
       title: 'Cropped', blob: enc.blob, filename: outName(S.file, 'cropped', enc.ext), before: S.file.size,
-      note: [`${ir.w} × ${ir.h} px at full resolution · ${typeName(enc.type)}`, S.src.scaled && 'The original was larger than your browser can handle, so it was scaled to about 16 MP first', enc.note].filter(Boolean).join('. '),
+      note: [`${ir.w} × ${ir.h} px at full resolution · ${typeName(enc.type)}`, capNote(S.src), enc.note].filter(Boolean).join('. '),
     });
   }), { full: true });
 
@@ -685,10 +706,10 @@ async function enhanceImage(root) {
     if (up === '1' && sharp === '0' && levels === '0') return notice('Turn on at least one option above.', 'warn');
     const { canvas: src, w: W0, h: H0 } = S.src;
     const long = Math.max(W0, H0);
+    // 2× stops at 3200 px on the long side; a photo already at (or near) that size keeps its own size
     let factor = up === '2' ? Math.min(2, WORK.enhanceMax / long) : 1;
-    if (factor < 1 && up === '1') factor = 1;
-    if (long * factor > WORK.enhanceMax) factor = WORK.enhanceMax / long;     // big photos are worked at ≤3200 px
     const skippedUp = up === '2' && factor < 1.05;
+    if (factor < 1.05) factor = 1;
     const W1 = Math.max(1, Math.round(W0 * factor)), H1 = Math.max(1, Math.round(H0 * factor));
     const y = yieldWith(p, 0.45, 0.9);
     p.set(0.1, factor > 1.05 ? 'Enlarging…' : 'Preparing…');
@@ -703,8 +724,7 @@ async function enhanceImage(root) {
     }
     if (sharp !== '0') {
       p.set(0.45, 'Sharpening…');
-      const s = await unsharp3(img.data, W1, H1, sharp === '2' ? 1.15 : 0.6, 2, y);
-      img.data.set(s);
+      await unsharp3(img.data, W1, H1, sharp === '2' ? 1.15 : 0.6, 2, y);
       done.push(sharp === '2' ? 'strongly sharpened' : 'gently sharpened');
     }
     p.set(0.92, 'Saving…');
@@ -713,8 +733,8 @@ async function enhanceImage(root) {
     free(c);
     const rc = await resultCard({
       title: 'Enhanced', blob, filename: outName(S.file, 'enhanced', 'jpg'), before: S.file.size,
-      note: `${W0} × ${H0} → ${W1} × ${H1} px · ${done.join(', ') || 'saved'}` +
-        (skippedUp ? '. Your photo is already large, so it wasn’t enlarged further.' : ''),
+      note: [`${W0} × ${H0} → ${W1} × ${H1} px · ${done.join(', ') || 'saved'}`,
+        skippedUp && 'Your photo is already large, so it wasn’t enlarged further', capNote(S.src)].filter(Boolean).join('. '),
     });
     return addBeforeAfter(rc, S.before, S.bag);
   }), { full: true });
@@ -765,22 +785,27 @@ async function stripMeta(root) {
     const want = keepType(S.file.type);
     // Re-encoding via canvas writes pixels only: EXIF, GPS, XMP, IPTC and comments are all dropped.
     const enc = await encodeAs(S.src.canvas, want, 0.95);
+    // Check what the new file still says. Safari's encoder adds its own tiny EXIF block (pixel
+    // size, colour space) and an empty IPTC record; parseMeta doesn't count those.
     const check = parseMeta(new Uint8Array(await enc.blob.arrayBuffer()));
-    const clean = !check.exif && !check.gps && !check.xmp && !check.iptc && !check.comment;
+    const left = [check.gps && 'location', camera(check) && 'camera', check.taken && 'date', check.software && 'software',
+      others(check).length && 'other tags'].filter(Boolean);
+    const clean = !left.length;
     const m = meta || {};
     const cam = camera(m);
-    const headline = m.gps ? 'Location removed ✓' : 'Metadata removed ✓';
+    const headline = !clean ? 'Some details remain' : m.gps ? 'Location removed ✓' : 'Metadata removed ✓';
+    const row = (k, had, still) => [k, still ? 'Still in the file' : had ? 'Removed ✓' : 'None to remove ✓', still ? 'warn' : 'ok'];
     const nodes = [
-      notice(h('div', {}, h('b', {}, headline), h('div', {}, clean ? 'We checked the new file: no location, camera or date details are left.' : 'Most details were removed, but some remain — try converting to PNG.')), clean ? 'ok' : 'warn'),
+      notice(h('div', {}, h('b', {}, headline), h('div', {}, clean ? 'We checked the new file: no location, camera or date details are left.' : `We checked the new file and these are still in it: ${left.join(', ')}.`)), clean ? 'ok' : 'warn'),
       card(kvList([
-        ['Location', m.gps ? 'Removed ✓' : 'None to remove ✓', 'ok'],
-        ['Camera details', cam ? 'Removed ✓' : 'None to remove ✓', 'ok'],
-        ['Date & other tags', m.taken || m.exif || m.xmp || m.iptc ? 'Removed ✓' : 'None to remove ✓', 'ok'],
+        row('Location', m.gps, check.gps),
+        row('Camera details', cam, camera(check)),
+        row('Date & other tags', m.taken || m.software || others(m).length, check.taken || check.software || others(check).length),
       ])),
       await resultCard({
         title: 'Clean copy ready', blob: enc.blob, filename: outName(S.file, 'clean', enc.ext), before: S.file.size,
         note: [`${S.src.w} × ${S.src.h} px · ${typeName(enc.type)}, re-saved at high quality`,
-          S.src.scaled && 'Scaled to about 16 MP (your browser’s limit)', enc.note].filter(Boolean).join('. '),
+          capNote(S.src), enc.note].filter(Boolean).join('. '),
       }),
     ];
     return nodes;

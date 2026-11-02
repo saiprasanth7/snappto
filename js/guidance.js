@@ -3,7 +3,8 @@
 export const PORTAL = 'https://www.passportindia.gov.in';
 const link = (href, text) => `<a href="${href}" target="_blank" rel="noopener">${text} ↗</a>`;
 
-export const GUIDES = {
+// No prototype, so a URL like #/guide/constructor finds nothing.
+export const GUIDES = Object.assign(Object.create(null), {
   new_passport: { title: 'Apply for a new passport', body: `
     <p><b>Steps (Passport Seva)</b></p>
     <ol><li>Register / log in on the official portal</li>
@@ -82,6 +83,6 @@ export const GUIDES = {
     <li>${link(PORTAL + '/Online/index', 'Apply · appointment · track')}</li>
     <li>${link('https://www.mea.gov.in', 'Ministry of External Affairs')}</li>
     <li>Helpline: <b>1800-258-1800</b></li></ul>` },
-};
+});
 
 export const DISCLAIMER = 'Guidance only. Always confirm on the official portal. SnappTo can’t approve, speed up or submit applications.';

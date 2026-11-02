@@ -11,3 +11,12 @@ export function pushRecent(id) { const r = recent().filter(x => x !== id); r.uns
 export const favs = () => get('favs', []);
 export const isFav = id => favs().includes(id);
 export function toggleFav(id) { const f = favs(); const i = f.indexOf(id); i >= 0 ? f.splice(i, 1) : f.unshift(id); set('favs', f); return i < 0; }
+
+/** Remove everything SnappTo saved in this browser (every 'snappto:' key). */
+export function clearAll() {
+  try {
+    // Collect first: removing while walking localStorage by index skips keys.
+    const keys = Object.keys(localStorage).filter(k => k.startsWith(K));
+    for (const k of keys) localStorage.removeItem(k);
+  } catch { /* ignore */ }
+}

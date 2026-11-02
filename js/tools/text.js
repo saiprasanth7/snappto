@@ -55,8 +55,9 @@ export function changeCase(s, mode) {
     case 'lower': return s.toLowerCase();
     case 'title': return s.replace(WORD_RE, (w, off) => {
       const lw = lowerKeep(w);
-      const before = s.slice(0, off).replace(/[ \t"'“‘(\[]+$/, '');
-      const first = !before || /[.!?:;\n—–-]$/.test(before);
+      let p = off - 1;                                  // look back past spaces, quotes and brackets (no prefix copy: stays linear)
+      while (p >= 0 && ' \t"\'“‘(['.includes(s[p])) p--;
+      const first = p < 0 || /[.!?:;\n—–-]/.test(s[p]);
       return !first && SMALL.has(lw) ? lw : (lw === w && mixed && isAcronym(w) ? w : cap1(lw));
     });
     case 'sentence': {
@@ -165,24 +166,55 @@ export function buildRegex(find, { caseSensitive = false, wholeWord = false, reg
     try { return { re: new RegExp(`(?<![\\p{L}\\p{N}\\p{M}_])(?:${src})(?![\\p{L}\\p{N}\\p{M}_])`, flags + 'u') }; } catch { /* fall back */ }
     try { return { re: new RegExp(`\\b(?:${src})\\b`, flags) }; } catch (e) { return { error: cleanReErr(e) }; }
   }
+  // 'u' keeps emoji whole and makes \p{L} work; patterns only valid without it (like \-) fall back.
+  try { return { re: new RegExp(src, flags + 'u') }; } catch { /* fall back */ }
   try { return { re: new RegExp(src, flags) }; } catch (e) { return { error: cleanReErr(e) }; }
 }
 const cleanReErr = e => String(e && e.message || e).replace(/^Invalid regular expression:\s*/i, '').replace(/^\/.*\/[a-z]*:\s*/, '');
+/** Expand $1, $&, $<name>, $$… the way String.replace does, so one pass can both count and replace. */
+function expandRep(rep, caps, pos, str, groups) {
+  if (!rep.includes('$')) return rep;
+  let out = '';
+  for (let i = 0; i < rep.length; i++) {
+    const c = rep[i], n = rep[i + 1];
+    if (c !== '$' || n === undefined) out += c;
+    else if (n === '$') { out += '$'; i++; }
+    else if (n === '&') { out += caps[0]; i++; }
+    else if (n === '`') { out += str.slice(0, pos); i++; }
+    else if (n === "'") { out += str.slice(pos + caps[0].length); i++; }
+    else if (n >= '0' && n <= '9') {
+      let d = /^\d\d?/.exec(rep.slice(i + 1))[0];
+      if (d.length === 2 && +d >= caps.length) d = d[0];               // "$12" with one group is $1 then "2"
+      const k = +d;
+      out += k >= 1 && k < caps.length ? caps[k] ?? '' : '$' + d;
+      i += d.length;
+    } else if (n === '<') {
+      const gt = rep.indexOf('>', i + 2);
+      if (gt < 0 || !groups) { out += '$<'; i++; } else { out += groups[rep.slice(i + 2, gt)] ?? ''; i = gt; }
+    } else out += c;
+  }
+  return out;
+}
 export function findReplace(s, find, rep, opts = {}) {
   s = String(s || '');
   const { re, error } = buildRegex(find, opts);
   if (error) return { out: s, count: 0, error };
   if (!re) return { out: s, count: 0 };
+  const r = opts.regex ? String(rep ?? '').replace(/\\n/g, '\n').replace(/\\t/g, '\t') : String(rep ?? '');
   let count = 0;
-  for (const _ of s.matchAll(re)) { if (++count > 1e6) break; }
-  const out = opts.regex
-    ? s.replace(re, String(rep ?? '').replace(/\\n/g, '\n').replace(/\\t/g, '\t'))
-    : s.replace(re, () => rep ?? '');
+  const out = s.replace(re, (...a) => {
+    count++;
+    if (!opts.regex) return r;
+    const groups = typeof a[a.length - 1] === 'object' ? a.pop() : undefined;
+    const str = a.pop(), pos = a.pop();
+    return expandRep(r, a, pos, str, groups);
+  });
   return { out, count };
 }
 
 // ── extract emails / phones / links ─────────────────────────────────
-const EMAIL_RE = /[\p{L}\p{N}._%+-]+@(?:[\p{L}\p{N}-]+\.)+\p{L}{2,}/gu;
+// Bounded parts (RFC limits) keep this linear: an unbounded run before "@" made long tokens quadratic.
+const EMAIL_RE = /[\p{L}\p{N}._%+-]{1,64}@(?:[\p{L}\p{N}-]{1,63}\.){1,8}\p{L}{2,24}/gu;
 const URL_RE = /\b(?:https?:\/\/|www\.)[^\s<>"'`]+/giu;
 const PHONE_RE = /(?:\+|\b00|\()?\d[\d \t().-]{6,40}\d/g;
 function trimUrl(u) {
@@ -232,8 +264,9 @@ export function extractInfo(s) {
   s = String(s || '');
   const uniq = (arr, key = x => x) => { const seen = new Set(), out = []; for (const x of arr) { const k = key(x); if (!seen.has(k)) { seen.add(k); out.push(x); } } return out; };
   const urls = uniq((s.match(URL_RE) || []).map(trimUrl).filter(u => u.length > 4));
-  const emails = uniq(s.match(EMAIL_RE) || [], e => e.toLowerCase());
-  const rest = s.replace(URL_RE, ' ').replace(EMAIL_RE, ' ');
+  const at = s.includes('@');
+  const emails = at ? uniq(s.match(EMAIL_RE) || [], e => e.toLowerCase()) : [];
+  const rest = at ? s.replace(URL_RE, ' ').replace(EMAIL_RE, ' ') : s.replace(URL_RE, ' ');
   const phones = uniq((rest.match(PHONE_RE) || []).flatMap(phonesIn), p => p.key).map(p => p.display);
   return { emails, phones, urls };
 }
@@ -426,6 +459,14 @@ export function wrapText(text, maxW, measure) {
   }
   return out;
 }
+/** Keep at most n lines; when some are cut, the last one ends in "…" so the cut shows. */
+export function fitLines(lines, n, maxW, measure) {
+  if (lines.length <= n) return lines;
+  const out = lines.slice(0, n), g = graphemeList(out[n - 1].trimEnd());
+  while (g.length && measure(g.join('') + '…') > maxW) g.pop();
+  out[n - 1] = g.join('').trimEnd() + '…';
+  return out;
+}
 
 // ── passwords ───────────────────────────────────────────────────────
 export const SETS = { upper: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', lower: 'abcdefghijklmnopqrstuvwxyz', digits: '0123456789', symbols: '!@#$%^&*-_=+?.,:;~()[]{}' };
@@ -497,13 +538,14 @@ export function crackTime(bits) {
 // ── speech ──────────────────────────────────────────────────────────
 /** Split text into sentence-sized chunks (≤ max chars) so long texts play reliably. */
 export function chunkSpeech(text, max = 200) {
-  const pieces = (String(text || '').match(/[^.!?।॥\n]+[.!?।॥]*|[.!?।॥]+/g) || []).map(x => x.replace(/\s+/g, ' ').trim()).filter(x => WORDCH.test(x));
+  // A mark ends a sentence only before a space or the end, so 7.5%, 1,299.50, 10.30 and www.x.in stay whole.
+  const pieces = (String(text || '').match(/(?:[^.!?।॥\n]|[.!?।॥](?!\s|$))+[.!?।॥]*|[.!?।॥]+/g) || []).map(x => x.replace(/\s+/g, ' ').trim()).filter(x => WORDCH.test(x));
   const out = [];
   const pushLong = p => {
     if (p.length <= max) { out.push(p); return; }
     let cur = '';
     const add = w => { if (cur && (cur + ' ' + w).length > max) { out.push(cur); cur = w; } else cur = cur ? cur + ' ' + w : w; };
-    for (const clause of p.match(/[^,;:]+[,;:]*/g) || [p]) {        // prefer breaking after commas
+    for (const clause of p.match(/(?:[^,;:]|[,;:](?!\s|$))+[,;:]*/g) || [p]) {        // prefer breaking after commas (not inside 1,299 or 10:30)
       const c = clause.trim(); if (!c) continue;
       if (c.length > max) c.split(/\s+/).forEach(add);
       else if (cur && (cur + ' ' + c).length > max) { out.push(cur); cur = c; } else add(c);
@@ -593,7 +635,7 @@ function mountCase(root) {
   const out = outputBox('');
   root.append(card({}, T.el), card({ title: 'Change to' }, seg.el), card({ title: 'Result' }, out));
   const upd = () => out.set(changeCase(T.value, mode) || '');
-  T.input.addEventListener('input', upd); upd();
+  T.input.addEventListener('input', debounce(upd, 80)); upd();
 }
 
 // ── Clean up ────────────────────────────────────────────────────────
@@ -639,26 +681,50 @@ function mountSort(root) {
 }
 
 // ── Find & replace ──────────────────────────────────────────────────
+// A typed pattern like (\w+\s?)+$ can backtrack for minutes, and a running regex can't be interrupted.
+// So Pattern mode runs in a worker (built from the same functions as above) that is thrown away when it takes too long.
+const RE_TIMEOUT = 1500;
+let reWorkerUrl = null;
+function regexWorker() {
+  reWorkerUrl ||= URL.createObjectURL(new Blob([`const escRe = ${escRe};\nconst cleanReErr = ${cleanReErr};\n${buildRegex}\n${expandRep}\n${findReplace}\n`
+    + 'onmessage = e => { const t0 = Date.now(), r = findReplace(...e.data.args); postMessage({ id: e.data.id, ms: Date.now() - t0, ...r }); };'], { type: 'text/javascript' }));
+  return new Worker(reWorkerUrl);
+}
 function mountFind(root) {
   const T = ta('Your text', 'Paste text here…', 8);
   const F = field({ label: 'Find', placeholder: 'Word or phrase' });
   const R = field({ label: 'Replace with', placeholder: 'Leave empty to delete matches' });
   const o = { caseSensitive: false, wholeWord: false, regex: false };
   const tg = (k, l) => toggle(l, false, v => { o[k] = v; upd(); }).el;
-  const count = h('div');
+  const count = h('div', { style: { marginBottom: '14px' } });
   const out = outputBox('');
   root.append(card({}, T.el), card({ title: 'Find & replace' }, F.el, R.el, tg('caseSensitive', 'Match capital letters exactly'), tg('wholeWord', 'Whole words only'),
     tg('regex', 'Pattern (regular expression)')), count, card({ title: 'Result' }, out));
-  const upd = () => {
-    const r = findReplace(T.value, F.value, R.value, o);
+  const show = r => {
     out.set(r.out);
     count.replaceChildren(r.error ? notice(`That pattern isn’t valid: ${r.error}`, 'err')
       : !F.value ? muted('Type what to find.')
-        : notice(r.count ? `${r.count.toLocaleString('en-IN')} match${r.count === 1 ? '' : 'es'} replaced` : 'No matches found', r.count ? 'ok' : 'info'));
-    count.style.marginBottom = '14px';
+        : r.count ? notice(`${r.count.toLocaleString('en-IN')} match${r.count === 1 ? '' : 'es'} replaced`, 'ok')
+          // Safari quietly reports "no match" when a pattern backtracks too much, so a slow miss may not be a real miss.
+          : notice(r.ms > 300 ? 'No matches found. This pattern is slow on this text, so some matches may have been missed. Try a more specific pattern.' : 'No matches found', 'info'));
   };
-  const d = debounce(upd, 60);
-  for (const f of [T, F, R]) f.input.addEventListener('input', d);
+  let worker = null, job = 0, running = false, timers = [];
+  const stop = () => { timers.forEach(clearTimeout); timers = []; if (worker && running) { worker.terminate(); worker = null; } running = false; };
+  const upd = () => {
+    const id = ++job;
+    stop();
+    if (!o.regex || !F.value || typeof Worker === 'undefined') return show(findReplace(T.value, F.value, R.value, o));
+    try { worker ||= regexWorker(); } catch { return show(findReplace(T.value, F.value, R.value, o)); }
+    worker.onmessage = e => { if (e.data.id !== job) return; running = false; stop(); show(e.data); };
+    worker.onerror = e => { e.preventDefault(); if (id !== job) return; stop(); count.replaceChildren(notice('Couldn’t run this pattern here. Please reload the page and try again.', 'err')); };
+    running = true;
+    worker.postMessage({ id, args: [T.value, F.value, R.value, { ...o }] });
+    timers.push(setTimeout(() => { if (id === job) count.replaceChildren(muted('Searching…')); }, 300),
+      setTimeout(() => { if (id !== job) return; stop(); count.replaceChildren(notice('This pattern takes too long on this text, so it was stopped. Try a more specific pattern.', 'warn')); }, RE_TIMEOUT));
+  };
+  const quick = debounce(upd, 60), slow = debounce(upd, 250);        // patterns wait for a pause in typing
+  for (const f of [T, F, R]) f.input.addEventListener('input', () => (o.regex ? slow : quick)());
+  onLeave(root, () => { job++; stop(); if (worker) worker.terminate(); worker = null; });
   upd();
 }
 
@@ -798,10 +864,13 @@ async function textToPdf(text, { title, size }, onProgress) {
   const ctx = cv.getContext('2d');
   const FONT = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans", "Noto Sans Devanagari", "Noto Sans Telugu", "Nirmala UI", sans-serif';
   const px = size * S, lh = Math.round(px * 1.5), maxW = (PW - 2 * M) * S;
+  const tpx = Math.round(px * 1.6), tlh = Math.round(tpx * 1.25);
+  ctx.font = `600 ${tpx}px ${FONT}`;
+  const tLines = title ? fitLines(wrapText(title, maxW, s => ctx.measureText(s).width), 4, maxW, s => ctx.measureText(s).width) : [];
   ctx.font = `${px}px ${FONT}`;
   const lines = wrapText(text, maxW, s => ctx.measureText(s).width);
   const top = M * S, bottom = H - M * S - 18 * S;
-  const titleH = title ? Math.round(px * 1.6 * 1.5) + 10 * S : 0;
+  const titleH = tLines.length ? tLines.length * tlh + Math.round(tpx * 0.5) + 10 * S : 0;
   const pages = []; let cur = [], y = top + titleH;
   for (const l of lines) {
     if (y + lh > bottom && cur.length) { pages.push(cur); cur = []; y = top; }
@@ -816,10 +885,9 @@ async function textToPdf(text, { title, size }, onProgress) {
     ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H);
     ctx.fillStyle = '#111'; ctx.textBaseline = 'alphabetic';
     let yy = top;
-    if (k === 0 && title) {
-      ctx.font = `600 ${Math.round(px * 1.6)}px ${FONT}`;
-      const tl = wrapText(title, maxW, s => ctx.measureText(s).width)[0] || title;
-      ctx.fillText(tl, M * S, yy + Math.round(px * 1.6));
+    if (k === 0 && tLines.length) {
+      ctx.font = `600 ${tpx}px ${FONT}`;
+      tLines.forEach((t, i) => ctx.fillText(t, M * S, yy + tpx + i * tlh));
       yy += titleH;
     }
     ctx.font = `${px}px ${FONT}`;
@@ -892,7 +960,8 @@ function mountRandom(root) {
     hist.textContent = history.length > 1 ? 'Before: ' + history.slice(1).join(' · ') : '';
   };
   // number
-  const Min = field({ label: 'From', inputmode: 'numeric', value: '1' }), Max = field({ label: 'To', inputmode: 'numeric', value: '100' });
+  // No inputmode on From/To: the iPhone number pad has no minus key, and these may be negative.
+  const Min = field({ label: 'From', value: '1' }), Max = field({ label: 'To', value: '100' });
   const Cnt = field({ label: 'How many', inputmode: 'numeric', value: '1' });
   let noRep = true;
   panes.number = h('div', { class: 'stack' }, h('div', { class: 'row' }, Min.el, Max.el), Cnt.el, toggle('No repeats', true, v => { noRep = v; }).el);
@@ -962,9 +1031,29 @@ function loadLists() {
   const first = { id: uid(), name: 'My list', items: [] };
   return { lists: [first], active: first.id };
 }
+/** Text pasted into the checklist → {name, items}. A list copied with "Copy list" (name, then ☐ / ☑ lines) comes back with its name and ticks. */
+export function parseChecklistPaste(text) {
+  const lines = String(text || '').split(/\r\n?|\n/).map(s => s.trim()).filter(Boolean);
+  const box = /^([☐☑])\s*/;
+  const named = lines.length > 1 && !box.test(lines[0]) && lines.slice(1).every(l => box.test(l));
+  const items = (named ? lines.slice(1) : lines).map(l => { const m = box.exec(l); return { text: m ? l.slice(m[0].length) : l, done: !!m && m[1] === '☑' }; });
+  return { name: named ? lines[0] : null, items: items.filter(i => i.text) };
+}
+// Same checks as the app shell's install banner.
+const isIOS = () => /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const standalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 function mountChecklist(root) {
   const data = loadLists();
-  const save = () => store.set(CL_KEY, data);
+  // Ask the browser not to clear the lists when space runs low (once there is something to keep).
+  // Chrome may agree; Safari mostly keeps its own rules, which the iPhone note below explains.
+  let askedPersist = false;
+  const keep = () => {
+    if (askedPersist) return;
+    askedPersist = true;
+    try { navigator.storage?.persist?.().catch(() => {}); } catch { /* ignore */ }
+  };
+  const save = () => { store.set(CL_KEY, data); keep(); };
+  if (data.lists.some(l => l.items.length)) keep();
   const cur = () => data.lists.find(l => l.id === data.active) || data.lists[0];
   const picker = field({ label: 'List', options: [] });
   const add = h('input', { type: 'text', placeholder: 'Add an item…', enterkeyhint: 'done', autocomplete: 'off',
@@ -990,16 +1079,30 @@ function mountChecklist(root) {
     data.active = data.lists[0].id; save(); draw();
   }, { variant: 'danger', small: true });
   picker.input.addEventListener('change', () => { data.active = picker.value; save(); draw(); });
+  const toItems = arr => arr.map(i => ({ id: uid(), text: i.text.slice(0, 500), done: !!i.done }));
   function addItems() {
-    const lines = add.value.split('\n').map(s => s.trim()).filter(Boolean);
-    if (!lines.length) return;
-    cur().items.push(...lines.map(text => ({ id: uid(), text: text.slice(0, 500), done: false })));
+    const text = add.value.trim();
+    if (!text) return;
+    cur().items.push(...toItems([{ text }]));
     add.value = ''; save(); draw(); add.focus();
   }
   add.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addItems(); } });
+  // A text input drops line breaks from its value, so pasted lines are split here, never via add.value.
   add.addEventListener('paste', e => {
     const t = e.clipboardData && e.clipboardData.getData('text');
-    if (t && t.includes('\n')) { e.preventDefault(); add.value = t; addItems(); }
+    if (!t || !/[\r\n]/.test(t)) return;
+    e.preventDefault();
+    const v = add.value, a = add.selectionStart ?? v.length, b = add.selectionEnd ?? v.length;
+    const { name, items: got } = parseChecklistPaste(v.slice(0, a) + t + v.slice(b));
+    if (!got.length) return;
+    if (name) {                                                       // a list copied with "Copy list": bring it back as a list
+      let l = cur();
+      if (l.items.length) { l = { id: uid(), name: '', items: [] }; data.lists.push(l); data.active = l.id; }
+      l.name = name.slice(0, 60);
+      l.items = toItems(got);
+      toast(`Restored “${l.name}” (${got.length} item${got.length === 1 ? '' : 's'})`, 'ok');
+    } else cur().items.push(...toItems(got));
+    add.value = ''; save(); draw(); add.focus();
   });
   function draw() {
     picker.input.replaceChildren(...data.lists.map(l => h('option', { value: l.id }, `${l.name} (${l.items.filter(i => !i.done).length})`)));
@@ -1025,7 +1128,8 @@ function mountChecklist(root) {
       h('div', { style: { display: 'flex', gap: '8px' } }, add, addBtn), items, foot,
       h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } }, clearDone, uncheck, copyAll)),
     h('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', margin: '0 2px' } }, rename, del),
-    h('p', { class: 'faint small', style: { margin: '12px 6px' } }, 'Saved on this phone only. Tip: paste several lines to add them all at once.'));
+    isIOS() && !standalone() ? h('div', { style: { margin: '12px 0 0' } }, notice('On iPhone and iPad, the browser may delete these lists if you don’t open SnappTo for about a week. To keep a copy, tap Copy list and save it in Notes. Pasting it back here restores the list.', 'warn')) : null,
+    h('p', { class: 'faint small', style: { margin: '12px 6px' } }, 'Your lists are kept in this browser on this device only. They aren’t backed up anywhere, so clearing website data removes them. Tip: paste several lines to add them all at once.'));
   draw();
 }
 
@@ -1058,21 +1162,31 @@ async function mountTts(root, defLang) {
   let voices = [];
   const setPh = () => { T.input.placeholder = `Type or paste text — or just tap Play to hear: “${sample[lang] || sample.en}”`; };
   const langSeg = segmented(Object.entries(LANGS), lang, v => { lang = v; store.set('text:tts-lang:' + defLang, v); fillVoices(); setPh(); });
+  // Desktop Chrome and Edge also list cloud voices ("Google …", "… Online"): they send the text away and fail offline.
+  const online = v => v.localService === false;
+  const okOnline = new Set();                                         // online voices the user has been told about
+  let list = [];
   function fillVoices() {
     const pref = lang === 'en' ? ['en-in', 'en-gb', 'en-us', 'en'] : [lang];
-    const list = voices.filter(v => lang === 'all' || (v.lang || '').toLowerCase().replace('_', '-').startsWith(lang))
+    list = voices.filter(v => lang === 'all' || (v.lang || '').toLowerCase().replace('_', '-').startsWith(lang))
       .sort((a, b) => {
         const r = x => { const l = (x.lang || '').toLowerCase().replace('_', '-'); const k = pref.findIndex(p => l.startsWith(p)); return k < 0 ? 99 : k; };
-        return r(a) - r(b) || (b.localService - a.localService) || a.name.localeCompare(b.name);
+        return online(a) - online(b) || r(a) - r(b) || a.name.localeCompare(b.name);     // on-device voices first
       });
     const savedName = store.get('text:tts-voice:' + lang, '');
-    voiceF.input.replaceChildren(...(list.length ? list.map(v => h('option', { value: v.voiceURI || v.name }, `${v.name} · ${v.lang}`)) : [h('option', { value: '' }, 'Device default')]));
+    voiceF.input.replaceChildren(...(list.length ? list.map(v => h('option', { value: v.voiceURI || v.name }, `${v.name} · ${v.lang}${online(v) ? ' · online' : ''}`)) : [h('option', { value: '' }, 'Device default')]));
     const savedV = list.find(v => (v.voiceURI || v.name) === savedName);
     if (savedV) voiceF.value = savedV.voiceURI || savedV.name;
-    voiceNote.replaceChildren(!list.length && lang !== 'all' ? notice(h('span', {}, `No ${LANGS[lang]} voice found on this device. `,
-      h('span', { class: 'muted' }, 'On iPhone, add one in Settings ▸ Accessibility ▸ Spoken Content ▸ Voices. On Android, install it in Settings ▸ Text-to-speech.')), 'warn') : '');
+    noteVoice();
   }
-  voiceF.input.addEventListener('change', () => store.set('text:tts-voice:' + lang, voiceF.value));
+  function noteVoice() {
+    const v = list.find(x => (x.voiceURI || x.name) === voiceF.value);
+    voiceNote.replaceChildren(!list.length && lang !== 'all' ? notice(h('span', {}, `No ${LANGS[lang]} voice found on this device. `,
+      h('span', { class: 'muted' }, 'On iPhone, add one in Settings ▸ Accessibility ▸ Spoken Content ▸ Voices. On Android, install it in Settings ▸ Text-to-speech.')), 'warn')
+      : v && online(v) ? notice(h('span', {}, list.some(x => !online(x)) ? 'This is an online voice. ' : `This browser has only online voices${lang === 'all' ? '' : ` for ${LANGS[lang]}`}. `,
+        h('span', { class: 'muted' }, 'Your text is sent to the browser’s speech service (such as Google or Microsoft) to be read aloud, and it won’t work offline.')), 'warn') : '');
+  }
+  voiceF.input.addEventListener('change', () => { store.set('text:tts-voice:' + lang, voiceF.value); noteVoice(); });
   let queue = [], idx = 0, state = 'idle', current = null;
   const setState = (s, msg) => { state = s; status.textContent = msg || ''; play.querySelector('.lbl').textContent = s === 'paused' ? 'Resume' : 'Play'; pause.disabled = s !== 'speaking'; stop.disabled = s === 'idle'; };
   const play = button('Play', () => {
@@ -1082,6 +1196,13 @@ async function mountTts(root, defLang) {
     queue = chunkSpeech(text); idx = 0;
     if (!queue.length) { toast('Nothing to read'); return; }
     const voice = voices.find(v => (v.voiceURI || v.name) === voiceF.value);
+    // An online voice sends the user's own text away: say so once, and read it on the next tap.
+    const key = voice && online(voice) && T.value.trim() ? voice.voiceURI || voice.name : '';
+    if (key && !okOnline.has(key)) {
+      okOnline.add(key); current = null;
+      setState('idle', 'This voice is online, so your text will be sent to the browser’s speech service. Tap Play again to go ahead.');
+      return;
+    }
     const runId = Symbol('run'); current = runId;
     queue.forEach((chunk, k) => {
       const u = new SpeechSynthesisUtterance(chunk);
@@ -1099,7 +1220,7 @@ async function mountTts(root, defLang) {
   for (const b of [play, pause, stop]) b.style.flex = '1';
   root.append(card({}, T.el), card({ title: 'Language & voice' }, langSeg, voiceF.el, voiceNote, rate.el, pitch.el),
     h('div', { style: { display: 'flex', gap: '8px' } }, play, pause, stop), h('div', { style: { margin: '10px 4px' } }, status),
-    h('p', { class: 'faint small', style: { margin: '4px 6px' } }, 'Voices come from your phone, so the choice and quality depend on your device. Works offline with installed voices.'));
+    h('p', { class: 'faint small', style: { margin: '4px 6px' } }, 'Voices come from your device, so the choice and quality depend on it. Voices marked online send your text to the browser’s speech service; all others work offline.'));
   setState('idle');
   onLeave(root, () => { current = null; try { synth.cancel(); } catch { /* ignore */ } });
   setPh();

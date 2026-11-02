@@ -7,7 +7,7 @@ import { h, notice, tick } from '../ui.js';
 import { libs, vendorUrl } from '../lib.js';
 
 // ── errors ──────────────────────────────────────────────────────────
-/** An error whose message is already fit to show. kind: warn | locked | invalid | memory | other */
+/** An error whose message is already fit to show. kind: warn | locked | restricted | invalid | memory | browser | other */
 export class UserError extends Error {
   constructor(message, kind = 'warn', file) { super(message); this.name = 'UserError'; this.kind = kind; this.file = file; }
 }
@@ -18,6 +18,13 @@ export function lockedError(name) {
   return new UserError(`${quoted(name)} is password-protected — remove the password first (Unlock PDF runs in the Telegram bot).`, 'locked', name);
 }
 
+/** The PDF opens without a password but its maker set editing restrictions (an owner password). */
+export function restrictedError(name) {
+  return new UserError(`${quoted(name)} has editing restrictions set by whoever made it, so it can’t be changed here. PDF → Text and Compress ▸ Strong still work on it.`, 'restricted', name);
+}
+
+const OLD_BROWSER = 'Your browser is too old for this tool — update it (iPhone: Settings ▸ General ▸ Software Update)';
+
 /** Map anything thrown by pdf-lib / PDF.js / the browser to a UserError with a human message. */
 export function friendlyError(e, name) {
   if (e instanceof UserError) return e;
@@ -25,28 +32,39 @@ export function friendlyError(e, name) {
   const ename = (e && e.name) || '';
   // PDF.js 6 relies on very new JavaScript built-ins; older browsers fail with "x is not a function".
   if (ename === 'SyntaxError' || /sumPrecise|getOrInsert|fromBase64|toBase64|toHex|withResolvers|Promise\.try|\.try is not a function|toArray is not a function/.test(`${msg} ${(e && e.details) || ''}`)) {
-    return new UserError('Your browser is too old for this tool — update it (iPhone: Settings ▸ General ▸ Software Update), or use the Telegram bot.', 'browser', name);
+    return new UserError(`${OLD_BROWSER}, or use the Telegram bot.`, 'browser', name);
   }
   if (ename === 'PasswordException' || /is encrypted|password/i.test(msg)) return lockedError(name);
   if (ename === 'InvalidPDFException' || ename === 'MissingPDFException' || /call stack/i.test(msg) ||
       /Failed to parse|PDF header|Invalid PDF|invalid object|Expected instance of|Invalid object ref|xref/i.test(msg)) {
     return new UserError(`${quoted(name)} doesn’t look like a valid PDF — it may be damaged or only partly downloaded.`, 'invalid', name);
   }
-  if (e instanceof RangeError || /out of memory|allocation failed|Array buffer allocation|Invalid array length/i.test(msg)) {
+  // WebAssembly engines (text recognition) abort with "Aborted(OOM)" or "Cannot enlarge memory".
+  if (e instanceof RangeError || /out of memory|allocation failed|Array buffer allocation|Invalid array length|Aborted\(OOM\)|Cannot enlarge memory/i.test(msg)) {
     return new UserError('Your phone ran out of memory on this file — try a smaller file, or fewer pages at a time.', 'memory', name);
   }
   if (typeof console !== 'undefined') console.error(e);
   return new UserError(`Something went wrong${msg ? ` (${msg.slice(0, 160)})` : ''}. Please try again, or try a different file.`, 'other', name);
 }
 
-/** The in-place error box for any failure. Password-protected PDFs get a link to Unlock PDF. */
-export function errorNotice(e, name) {
+/** The words to show for a UserError. bot: false leaves out "use the Telegram bot" for tools the bot doesn't have. */
+export const messageFor = (u, { bot = true } = {}) => (u.kind === 'browser' && !bot ? `${OLD_BROWSER}.` : u.message);
+
+/**
+ * The in-place error box for any failure. Password-protected PDFs get a link to Unlock PDF,
+ * and PDFs with editing restrictions get links to the tools that still work. bot: as for messageFor.
+ */
+export function errorNotice(e, name, { bot = true } = {}) {
   const u = friendlyError(e, name);
   if (u.kind === 'locked') {
     return notice(h('span', {}, `${quoted(u.file)} is password-protected — remove the password first (`,
       h('a', { href: '#/tool/unlock' }, 'Unlock PDF'), ' runs in the Telegram bot).'), 'err');
   }
-  return notice(u.message, u.kind === 'warn' ? 'warn' : 'err');
+  if (u.kind === 'restricted') {
+    return notice(h('span', {}, `${quoted(u.file)} has editing restrictions set by whoever made it, so it can’t be changed here. `,
+      h('a', { href: '#/tool/pdftext' }, 'PDF → Text'), ' and ', h('a', { href: '#/tool/pdfcompress' }, 'Compress ▸ Strong'), ' still work on it.'), 'err');
+  }
+  return notice(messageFor(u, { bot }), u.kind === 'warn' ? 'warn' : 'err');
 }
 
 /** For failures while *opening* a file: anything that isn't a password or memory problem means the PDF is unreadable. */
@@ -303,7 +321,7 @@ export function looksLikePdf(bytes) {
   return false;
 }
 
-/** Open with pdf-lib. Throws UserError (locked / invalid / …) — never a raw library error. */
+/** Open with pdf-lib. Throws UserError (locked / restricted / invalid / …) — never a raw library error. */
 export async function openPdf(bytes, name) {
   const { PDFDocument } = await libs.pdfLib();
   if (!looksLikePdf(bytes)) throw new UserError(name ? `“${name}” isn’t a PDF file.` : 'That file isn’t a PDF.', 'invalid', name);
@@ -311,8 +329,17 @@ export async function openPdf(bytes, name) {
   try {
     doc = await PDFDocument.load(bytes, { updateMetadata: false });
     if (!doc.getPageCount()) throw new Error('Invalid PDF: no pages');
-  } catch (e) { throw openError(e, name); }
+  } catch (e) {
+    // pdf-lib can't decrypt anything. If PDF.js opens the file with no password, only an
+    // owner password (editing restrictions) is set, and Unlock would just ask for a password.
+    if (/is encrypted/i.test(String(e && e.message)) && await opensWithoutPassword(bytes)) throw restrictedError(name);
+    throw openError(e, name);
+  }
   return doc;
+}
+
+async function opensWithoutPassword(bytes) {
+  try { const { task } = await openPdfjs(bytes); await task.destroy(); return true; } catch { return false; }
 }
 
 export async function newPdf() {
@@ -325,14 +352,104 @@ export async function newPdf() {
 /** Copy pages (zero-based, in order, repeats allowed) of src into a new PDF. One copy pass, so shared fonts stay shared. */
 export async function copyToNew(src, indices) {
   const out = await newPdf();
-  const pages = await out.copyPages(src, indices);
-  for (const p of pages) out.addPage(p);
+  await copyPagesInto(out, src, indices);
   return out;
 }
 
+/**
+ * Copy pages (zero-based, in order, repeats allowed) of src onto the end of out; returns them.
+ * pdf-lib's copyPages follows every link, so a table of contents would drag every page it
+ * points to into the file, invisible but readable. Here each page is copied through its
+ * own ref, so links between copied pages land on the copies, and nothing leads into a
+ * page left behind: links to it are removed, and so are form-field and article ties.
+ */
+export async function copyPagesInto(out, src, indices) {
+  const L = await libs.pdfLib();
+  const { PDFObjectCopier, PDFPage, PDFPageLeaf, PDFRef, PDFDict, PDFName, PDFNull } = L;
+  await src.flush();
+  const pages = src.getPages();
+  const keep = new Set(indices.map(i => pages[i].ref));
+  const annotRefs = p => (p.node.Annots()?.asArray() || []).filter(a => a instanceof PDFRef);
+  // Pages left behind, and annotations that live only on them.
+  const gone = new Set(pages.map(p => p.ref).filter(r => !keep.has(r)));
+  const partial = gone.size > 0;
+  for (const p of pages) if (gone.has(p.ref)) for (const a of annotRefs(p)) gone.add(a);
+  for (const p of pages) if (keep.has(p.ref)) for (const a of annotRefs(p)) gone.delete(a);
+
+  const Subtype = PDFName.of('Subtype'), Widget = PDFName.of('Widget'), Parent = PDFName.of('Parent'), B = PDFName.of('B');
+  const copier = PDFObjectCopier.for(src.context, out.context);
+  const copy = copier.copy;
+  copier.copy = obj => {
+    if (obj instanceof PDFRef && gone.has(obj)) return PDFNull;
+    if (partial && obj instanceof PDFDict) {
+      // A form field's other widgets (and their values) and article beads lead to other pages.
+      const cut = obj instanceof PDFPageLeaf ? B : obj.get(Subtype) === Widget ? Parent : null;
+      if (cut && obj.has(cut)) { obj = obj.clone(); obj.delete(cut); }
+    }
+    return copy(obj);
+  };
+
+  const added = [], copied = new Set();
+  for (const i of indices) {
+    const { ref } = pages[i];
+    let page;
+    if (copied.has(ref)) {   // a repeat gets a page object of its own
+      const node = copier.copy(pages[i].node);
+      page = PDFPage.of(node, out.context.register(node), out);
+    } else {
+      copied.add(ref);
+      const to = copier.copy(ref);
+      page = PDFPage.of(out.context.lookup(to), to, out);
+    }
+    out.addPage(page);
+    added.push(page);
+  }
+  for (const page of added) dropDeadLinks(page, L);
+  return added;
+}
+
+/** Remove links whose target page was left behind (copyPagesInto turned the target into null). */
+function dropDeadLinks(page, { PDFDict, PDFArray, PDFName, PDFNull }) {
+  const annots = page.node.Annots();
+  if (!annots) return;
+  const Link = PDFName.of('Link'), A = PDFName.of('A');
+  for (let i = annots.size() - 1; i >= 0; i--) {
+    const a = annots.lookup(i);
+    if (!(a instanceof PDFDict) || a.get(PDFName.of('Subtype')) !== Link) continue;
+    const act = a.lookup(A);
+    const dest = a.lookup(PDFName.of('Dest')) || (act instanceof PDFDict ? act.lookup(PDFName.of('D')) : undefined);
+    if (dest instanceof PDFArray && dest.get(0) === PDFNull) annots.remove(i);
+  }
+}
+
+/**
+ * Drop every object nothing in the document points to any more (pages left behind, links
+ * just removed, leftovers of earlier edits), so they never travel inside the saved file.
+ */
+async function dropUnreachable(doc) {
+  const { PDFRef, PDFDict, PDFArray, PDFStream } = await libs.pdfLib();
+  const ctx = doc.context, seen = new Set();
+  const todo = [ctx.trailerInfo.Root, ctx.trailerInfo.Info, ctx.trailerInfo.Encrypt];
+  while (todo.length) {
+    const o = todo.pop();
+    if (!o || seen.has(o)) continue;
+    seen.add(o);
+    if (o instanceof PDFRef) todo.push(ctx.lookup(o));
+    else if (o instanceof PDFDict) { for (const v of o.values()) todo.push(v); }
+    else if (o instanceof PDFArray) { for (const v of o.asArray()) todo.push(v); }
+    else if (o instanceof PDFStream) todo.push(o.dict);
+  }
+  for (const [ref] of ctx.enumerateIndirectObjects()) if (!seen.has(ref)) ctx.delete(ref);
+}
+
+/** The finished file's bytes. */
+export async function pdfBytes(doc) {
+  await dropUnreachable(doc);
+  return doc.save({ useObjectStreams: true });
+}
+
 export async function savePdf(doc) {
-  const bytes = await doc.save({ useObjectStreams: true });
-  return new Blob([bytes], { type: 'application/pdf' });
+  return new Blob([await pdfBytes(doc)], { type: 'application/pdf' });
 }
 
 /** Turn pages by delta (90 | 180 | 270, clockwise) on top of their current rotation. */
@@ -447,7 +564,8 @@ export async function renderPage(pdf, pageNo, scale, { maxPixels = 12e6 } = {}) 
     canvas.width = Math.max(1, Math.floor(vp.width));
     canvas.height = Math.max(1, Math.floor(vp.height));
     // annotationMode 3 = ENABLE_STORAGE: filled-in form fields are drawn too.
-    await page.render({ canvas, viewport: vp, annotationMode: 3 }).promise;
+    try { await page.render({ canvas, viewport: vp, annotationMode: 3 }).promise; }
+    catch (e) { dropCanvas(canvas); throw e; }
     return { canvas, width: base.width, height: base.height };
   } finally {
     page.cleanup();

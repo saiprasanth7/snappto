@@ -21,10 +21,15 @@ export function qrLayout(count, quiet = 4, target = 1000) {
   return { scale, size: (count + 2 * quiet) * scale };
 }
 
+const safeDecode = s => { try { return decodeURIComponent(s); } catch { return s; } };
+
 // ── UPI ─────────────────────────────────────────────────────────────
 export const validVpa = v => /^[a-zA-Z0-9][a-zA-Z0-9._-]{1,255}@[a-zA-Z][a-zA-Z0-9.-]{1,63}$/.test(String(v || '').trim());
 export function cleanAmount(a) {
-  const s = String(a ?? '').trim().replace(/[,₹\s]/g, '');
+  let s = String(a ?? '').trim().replace(/[₹\s]/g, '');
+  // A comma-decimal keypad gives "99,50": one comma with 1 or 2 digits after it is a decimal point, not grouping.
+  if (!s.includes('.') && /^\d*,\d{1,2}$/.test(s)) s = s.replace(',', '.');
+  s = s.replace(/,/g, '');
   if (!s) return { ok: true, value: '' };
   if (!/^\d+(\.\d{1,2})?$/.test(s) || !(+s > 0)) return { ok: false };
   return { ok: true, value: (+s).toFixed(2) };
@@ -40,15 +45,27 @@ export function buildUpi({ vpa, name = '', amount = '', note = '' }) {
   if (String(note).trim()) q.push(`tn=${enc(note)}`);
   return 'upi://pay?' + q.join('&');
 }
+const UPI_KEYS = ['pa', 'pn', 'am', 'cu', 'tn', 'mc', 'recur', 'validitystart', 'validityend', 'amrule'];
+/**
+ * Read a upi:// link the way payment apps do: exact lowercase keys, values %-decoded.
+ * verb is 'pay', 'mandate' (AutoPay), etc. A key given twice, or as PA / p%61, is read
+ * differently by different apps, so it is never trusted: conflict = {key: [values seen]}.
+ */
 export function parseUpi(s) {
   const qi = s.indexOf('?');
-  const out = { pa: '', pn: '', am: '', cu: '', tn: '', mc: '' };
+  const out = { verb: ((/^upi:\/\/([^?#/]*)/i.exec(s) || [])[1] || '').toLowerCase(), conflict: null };
+  for (const k of UPI_KEYS) out[k] = '';
+  const seen = {};
   for (const part of (qi >= 0 ? s.slice(qi + 1) : '').split('&')) {
-    const k = part.split('=')[0].toLowerCase(), raw = part.slice(part.indexOf('=') + 1);
-    if (!(k in out) || out[k]) continue;
-    let v = raw.replace(/\+/g, ' ');
-    try { v = decodeURIComponent(v); } catch { /* keep raw */ }
-    out[k] = v.trim();
+    const eq = part.indexOf('='), name = eq >= 0 ? part.slice(0, eq) : part;
+    const k = safeDecode(name.replace(/\+/g, ' ')).trim().toLowerCase();
+    if (!UPI_KEYS.includes(k)) continue;
+    const v = safeDecode((eq >= 0 ? part.slice(eq + 1) : '').replace(/\+/g, ' ')).trim();
+    (seen[k] ||= []).push({ v, odd: name !== k });
+  }
+  for (const [k, list] of Object.entries(seen)) {
+    if (list.length === 1 && !list[0].odd) out[k] = list[0].v;
+    else (out.conflict ||= {})[k] = [...new Set(list.map(x => x.v))];
   }
   return out;
 }
@@ -78,15 +95,18 @@ export function parseWifi(s) {
 
 // ── vCard ───────────────────────────────────────────────────────────
 export const escVcard = s => String(s).replace(/\\/g, '\\\\').replace(/\r?\n/g, '\\n').replace(/([,;])/g, '\\$1');
-export function buildVcard({ name, phone = '', email = '', org = '' }) {
+/** One phone/email, or arrays (phones, emails, urls) when saving a scanned card with several. */
+export function buildVcard({ name, phone = '', email = '', org = '', phones, emails, urls = [], address = '', title = '' }) {
   const nm = String(name).trim().replace(/\s+/g, ' ');
   const parts = nm.split(' ');
   const last = parts.length > 1 ? parts.pop() : '';
   const lines = ['BEGIN:VCARD', 'VERSION:3.0', `N:${escVcard(last)};${escVcard(parts.join(' '))};;;`, `FN:${escVcard(nm)}`];
   if (String(org).trim()) lines.push(`ORG:${escVcard(org.trim())}`);
-  const tel = String(phone).replace(/[^\d+]/g, '');
-  if (tel) lines.push(`TEL;TYPE=CELL:${tel}`);
-  if (String(email).trim()) lines.push(`EMAIL;TYPE=INTERNET:${escVcard(email.trim())}`);
+  if (String(title).trim()) lines.push(`TITLE:${escVcard(title.trim())}`);
+  for (const p of phones ?? [phone]) { const tel = String(p).replace(/[^\d+]/g, ''); if (tel) lines.push(`TEL;TYPE=CELL:${tel}`); }
+  for (const e of emails ?? [email]) if (String(e).trim()) lines.push(`EMAIL;TYPE=INTERNET:${escVcard(String(e).trim())}`);
+  for (const u of urls) { const url = String(u).replace(/[\r\n]+/g, '').trim(); if (url) lines.push(`URL:${url}`); }
+  if (String(address).trim()) lines.push(`ADR:;;${escVcard(address.trim())};;;;`);
   lines.push('END:VCARD');
   return lines.join('\r\n');
 }
@@ -220,11 +240,11 @@ export function analyzeUrl(raw) {
   const host = u.hostname.toLowerCase(), uhost = unicodeHost(host);
   const bare = host.replace(/^www\./, '');
   if (scheme === 'http') warnings.push({ lvl: 'warn', msg: 'Not secure: it starts with http, not https — anything you type there can be seen by others.' });
-  if (/(^|\.)xn--/.test(host)) warnings.push({ lvl: 'danger', msg: `Uses look-alike letters from other alphabets. It really spells “${uhost}” — it may be pretending to be a site you know.` });
+  if (/(^|\.)xn--/.test(host)) warnings.push({ lvl: 'danger', msg: `Uses look-alike letters from other alphabets. The real address is ${host}, which can look like “${uhost}”. If that looks like a site you know, it is probably a fake.` });
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.startsWith('[')) warnings.push({ lvl: 'danger', msg: 'Goes to a bare number address (IP) instead of a named website — real businesses rarely do this.' });
   if (u.username || u.password || /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*@/i.test(String(raw).trim())) warnings.push({ lvl: 'danger', msg: `Contains “@” — everything before the @ is a decoy. The real site is ${host}.` });
   if (SHORTENERS.some(d => bare === d || bare.endsWith('.' + d))) warnings.push({ lvl: 'warn', msg: 'Shortened link — the real destination is hidden until you open it.' });
-  if (host.length > 45 || host.split('.').length > 4 || (host.match(/-/g) || []).length >= 3) warnings.push({ lvl: 'warn', msg: 'Unusually long or complicated website name — read it carefully, the real name is the part just before the last dot.' });
+  if (host.length > 45 || host.split('.').length > 4 || (host.replace(/(^|\.)xn--/g, '$1').match(/-/g) || []).length >= 3) warnings.push({ lvl: 'warn', msg: 'Unusually long or complicated website name — read it carefully, the real name is the part just before the last dot.' });
   if (/\.(zip|mov)$/.test(host)) warnings.push({ lvl: 'warn', msg: 'The website name ends like a file (.zip or .mov) — a common trick.' });
   if (u.port) warnings.push({ lvl: 'warn', msg: `Uses an unusual port (:${u.port}).` });
   if (String(raw).length > 300) warnings.push({ lvl: 'warn', msg: 'Very long link — long links can hide where they really go.' });
@@ -239,12 +259,11 @@ export function classifyScan(raw, format = 'qr_code') {
   if (/^WIFI:/i.test(s)) return { kind: 'wifi', text: s, ...parseWifi(s) };
   if (/^BEGIN:VCARD/i.test(s)) return { kind: 'contact', text: s, ...parseVcard(s) };
   if (/^MECARD:/i.test(s)) return { kind: 'contact', text: s, ...parseMecard(s) };
-  const dec = x => { try { return decodeURIComponent(x); } catch { return x; } };
-  if (/^tel:/i.test(s)) return { kind: 'phone', text: s, number: dec(s.slice(4)).trim() };
+  if (/^tel:/i.test(s)) return { kind: 'phone', text: s, number: safeDecode(s.slice(4)).trim() };
   if (/^mailto:/i.test(s)) {
     const [addr, q = ''] = s.slice(7).split('?');
     const p = new URLSearchParams(q);
-    return { kind: 'email', text: s, to: dec(addr), subject: p.get('subject') || '', body: p.get('body') || '' };
+    return { kind: 'email', text: s, to: safeDecode(addr), subject: p.get('subject') || '', body: p.get('body') || '' };
   }
   if (/^MATMSG:/i.test(s)) {
     const g = k => (new RegExp(`${k}:([^;]*)`, 'i').exec(s) || [])[1] || '';
@@ -253,7 +272,7 @@ export function classifyScan(raw, format = 'qr_code') {
   if (/^(smsto|sms):/i.test(s)) {
     const rest = s.replace(/^(smsto|sms):/i, '');
     const [num, ...msg] = rest.split(/[:?]/);
-    return { kind: 'sms', text: s, number: dec(num), body: dec(msg.join(':').replace(/^body=/i, '')) };
+    return { kind: 'sms', text: s, number: safeDecode(num), body: safeDecode(msg.join(':').replace(/^body=/i, '')) };
   }
   if (/^geo:/i.test(s)) { const [lat, lon] = s.slice(4).split(/[,;?]/); return { kind: 'geo', text: s, lat: +lat, lon: +lon }; }
   if (/^https?:\/\//i.test(s)) return { kind: 'url', text: s, ...analyzeUrl(s) };
@@ -589,10 +608,9 @@ async function mountScan(root) {
     if (!running) return;
     if (!root.isConnected) { stop(); return; }
     if (video.readyState >= 2) {
-      try {
-        const r = await detect(engine, video, work);
-        if (r && running) { found(r); return; }
-      } catch { /* a bad frame — keep going */ }
+      let r = null;
+      try { r = await detect(engine, video, work); } catch { /* a bad frame — keep going */ }
+      if (r && running) { found(r); return; }     // outside the try, so a display problem is never mistaken for a bad frame
     }
     if (running) timer = setTimeout(loop, 150);
   }
@@ -625,7 +643,19 @@ async function mountScan(root) {
     } catch (e) { out.replaceChildren(notice(e.message || 'Couldn’t read that image. Try a JPG or PNG.', 'err')); }
   }
   function show(text, format) {
-    out.replaceChildren(resultView(classifyScan(text, format), text, () => { out.replaceChildren(); start(); }));
+    const again = () => { out.replaceChildren(); start(); };
+    let view;
+    try { view = resultView(classifyScan(text, format), text, again); }
+    catch (e) {
+      console.error(e);
+      const cp = copyButton(text, 'Copy'); cp.classList.remove('btn-sm'); cp.style.flex = '1';
+      const ag = button('Scan again', again, { variant: 'secondary' }); ag.style.flex = '1';
+      view = h('section', { class: 'result' }, h('div', { class: 'rb stack' },
+        notice('Couldn’t show the details of this code. Here is the text inside it. Don’t open it unless you trust where it came from.', 'warn'),
+        h('div', { class: 'mono', style: { whiteSpace: 'pre-wrap', wordBreak: 'break-all' } }, text),
+        h('div', { style: { display: 'flex', gap: '9px', flexWrap: 'wrap' } }, cp, ag)));
+    }
+    out.replaceChildren(view);
     out.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 }
@@ -643,17 +673,33 @@ function urlBlock(a, raw) {
   if (!a.ok) return h('div', { class: 'mono', style: { wordBreak: 'break-all' } }, raw);
   const u = a.url;
   if (!a.openable) return h('div', { class: 'mono', style: { wordBreak: 'break-all', fontSize: '14px' } }, raw);
-  const user = u.username ? decodeURIComponent(u.username) + (u.password ? ':•••' : '') + '@' : '';
+  const user = u.username ? safeDecode(u.username) + (u.password ? ':•••' : '') + '@' : '';
+  // A look-alike (xn--) name is headlined as its real ASCII address; the disguise is only a footnote.
+  const lookAlike = a.uhost && a.uhost !== a.host;
   return h('div', { class: 'stack', style: { gap: '8px' } },
-    h('div', {}, h('div', { class: 'muted small' }, 'Website'), h('div', { style: { fontSize: '22px', fontWeight: '760', wordBreak: 'break-all', letterSpacing: '-.01em' } }, a.uhost && a.uhost !== a.host ? a.uhost : a.host)),
+    h('div', {}, h('div', { class: 'muted small' }, 'Website'), h('div', { style: { fontSize: '22px', fontWeight: '760', wordBreak: 'break-all', letterSpacing: '-.01em' } }, a.host),
+      lookAlike ? h('div', { class: 'small', style: { color: 'var(--err)', overflowWrap: 'anywhere' } }, `Written in other alphabets, so it can look like “${a.uhost}”`) : null),
     h('div', { class: 'mono', style: { wordBreak: 'break-all', fontSize: '13.5px', lineHeight: '1.5', padding: '10px 12px', background: 'var(--surface-2)', borderRadius: '10px' } },
       h('span', { style: { color: a.scheme === 'http' ? 'var(--err)' : 'var(--faint)' } }, a.scheme + '://'),
       user && h('span', { style: { color: 'var(--err)', textDecoration: 'line-through' } }, user),
       h('b', { style: { color: 'var(--text)', fontSize: '15px' } }, u.hostname + (u.port ? ':' + u.port : '')),
       h('span', { style: { color: 'var(--muted)' } }, u.pathname + u.search + u.hash)));
 }
+const UPI_LABEL = { pa: 'UPI ID', pn: 'name', am: 'amount', cu: 'currency', tn: 'note', mc: 'merchant code', recur: 'repeat schedule',
+  validitystart: 'start date', validityend: 'end date', amrule: 'amount rule' };
+const RECUR = { ONETIME: 'once, at a later date', DAILY: 'every day', WEEKLY: 'every week', FORTNIGHTLY: 'every two weeks', MONTHLY: 'every month',
+  BIMONTHLY: 'every two months', QUARTERLY: 'every three months', HALFYEARLY: 'every six months', YEARLY: 'every year', ASPRESENTED: 'whenever the merchant asks' };
+/** AutoPay dates are DDMMYYYY → "31 Dec 2030"; anything else is shown as given. */
+function upiDate(s) {
+  const m = /^(\d{2})(\d{2})(\d{4})$/.exec(s || '');
+  const d = m && new Date(Date.UTC(+m[3], +m[2] - 1, +m[1]));
+  if (!d || d.getUTCDate() !== +m[1] || d.getUTCMonth() !== +m[2] - 1) return s;
+  return new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }).format(d);
+}
+const andList = a => (a.length > 1 ? a.slice(0, -1).join(', ') + ' and ' + a[a.length - 1] : a[0] || '');
+
 function resultView(info, raw, again) {
-  const [icon, label] = KIND[info.kind] || KIND.text;
+  let [icon, label] = KIND[info.kind] || KIND.text;
   const body = h('div', { class: 'stack' });
   const acts = h('div', { style: { display: 'flex', gap: '9px', flexWrap: 'wrap' } });
   const cp = copyButton(raw, 'Copy'); cp.classList.remove('btn-sm'); cp.style.flex = '1';
@@ -665,26 +711,43 @@ function resultView(info, raw, again) {
     if (info.openable) {
       const danger = info.warnings.some(w => w.lvl === 'danger');
       const open = button('Open link', () => {
-        if (info.warnings.length && !confirm(`Open ${info.uhost || info.host}?\n\n${info.warnings.map(w => '• ' + w.msg).join('\n')}`)) return;
+        if (info.warnings.length && !confirm(`Open ${info.host}?\n\n${info.warnings.map(w => '• ' + w.msg).join('\n')}`)) return;
         window.open(info.url.href, '_blank', 'noopener,noreferrer');
       }, { variant: danger ? 'danger' : 'primary' });
       open.style.flex = '1 1 100%';
       acts.append(open);
     }
   } else if (info.kind === 'upi') {
-    const amt = info.am && /^\d+(\.\d+)?$/.test(info.am) ? +info.am : 0;
-    body.append(
-      notice(h('div', {}, h('b', {}, 'Check the name and amount before you pay.'), h('div', { class: 'small', style: { marginTop: '4px' } },
-        'You never need to scan a QR code or enter your UPI PIN to receive money — that’s a common scam.')), 'warn'),
-      h('div', {}, kv('Pay to', info.pn || h('span', { style: { color: 'var(--warn)' } }, 'No name given'), { bold: true, big: true }),
-        kv('UPI ID', info.pa || '—', { mono: true }),
-        kv('Amount', amt ? fmtINR(amt) : 'Not set — you’ll type it in your app', { bold: !!amt, big: !!amt }),
-        info.tn ? kv('Note', info.tn) : null,
-        info.cu && info.cu.toUpperCase() !== 'INR' ? kv('Currency', info.cu) : null));
+    const odd = info.conflict || {}, mandate = info.verb === 'mandate';
+    if (mandate) label = 'UPI AutoPay'; else if (info.verb !== 'pay') label = 'UPI request';
+    // A detail that apps may read two ways is never shown as one answer: every version is listed in red.
+    const alt = (k, v) => (odd[k] ? h('span', { style: { color: 'var(--err)' } }, odd[k].map(x => x || '(empty)').join(' or ')) : v);
+    const why = (title, text, kind) => notice(h('div', {}, h('b', {}, title), h('div', { class: 'small', style: { marginTop: '4px' } }, text)), kind);
+    const amOk = /^\d+(\.\d{1,2})?$/.test(info.am) && +info.am > 0;
+    const amount = amOk ? (/^max$/i.test(info.amrule) ? `Up to ${fmtINR(+info.am)} each time` : fmtINR(+info.am))
+      : info.am ? h('span', { style: { color: 'var(--warn)' } }, info.am) : 'Not set — you’ll type it in your app';
+    const often = RECUR[info.recur.toUpperCase()] || (info.recur ? `on the schedule “${info.recur}”` : 'again later');
+    const keys = Object.keys(odd);
+    if (keys.length) body.append(why('Don’t pay with this code.', `Its ${andList(keys.map(k => UPI_LABEL[k]))} ${keys.length > 1 ? 'are' : 'is'} written more than once or in an unusual way, so your payment app may not use what is shown here.`, 'err'));
+    if (mandate) body.append(why('This sets up AutoPay, not a one-time payment.', `If you approve it, money can be taken from your account ${often}${info.validityend ? ` until ${upiDate(info.validityend)}` : ''}. You never need to approve AutoPay to receive money.`, 'err'));
+    else if (info.verb !== 'pay') body.append(why('This isn’t a normal UPI payment code.', `It is a “${info.verb || 'unknown'}” request, not a payment. Don’t use it unless you know exactly what it does.`, 'err'));
+    else if (!keys.length) body.append(why('Check the name and amount before you pay.', 'You never need to scan a QR code or enter your UPI PIN to receive money — that’s a common scam.', 'warn'));
+    body.append(h('div', {}, kv('Pay to', alt('pn', info.pn || h('span', { style: { color: 'var(--warn)' } }, 'No name given')), { bold: true, big: true }),
+      kv('UPI ID', alt('pa', info.pa || '—'), { mono: true }),
+      kv('Amount', alt('am', amount), { bold: amOk && !odd.am, big: amOk && !odd.am }),
+      mandate || odd.recur ? kv('Repeats', alt('recur', info.recur ? often[0].toUpperCase() + often.slice(1) : 'Not stated')) : null,
+      info.validitystart || odd.validitystart ? kv('Starts', alt('validitystart', upiDate(info.validitystart))) : null,
+      info.validityend || odd.validityend ? kv('Ends', alt('validityend', upiDate(info.validityend))) : null,
+      info.tn || odd.tn ? kv('Note', alt('tn', info.tn)) : null,
+      (info.cu && info.cu.toUpperCase() !== 'INR') || odd.cu ? kv('Currency', alt('cu', info.cu)) : null));
+    if (info.am && !amOk && !odd.am) body.append(notice(`The amount in this code (“${info.am}”) isn’t written like a normal rupee amount, so your app may read it differently. Check the amount in your app before you pay.`, 'warn'));
     if (info.pa && !validVpa(info.pa)) body.append(notice('The UPI ID in this code looks malformed. Don’t pay unless you’re sure.', 'err'));
-    if (info.pa) {
+    if (info.pa && !keys.length && info.verb === 'pay') {
       const pay = h('a', { class: 'btn btn-primary', href: raw, style: { flex: '1 1 100%' } }, 'Open in UPI app');
       acts.append(pay);
+    } else if (info.pa && !keys.length && mandate) {
+      const ask = `Set up AutoPay for ${info.pn || info.pa}?\n\nMoney can be taken from your account ${often}${info.validityend ? ` until ${upiDate(info.validityend)}` : ''}.`;
+      acts.append(h('a', { class: 'btn btn-danger', href: raw, style: { flex: '1 1 100%' }, onclick: e => { if (!confirm(ask)) e.preventDefault(); } }, 'Set up AutoPay in UPI app'));
     }
   } else if (info.kind === 'wifi') {
     let shown = false;
@@ -699,7 +762,8 @@ function resultView(info, raw, again) {
   } else if (info.kind === 'contact') {
     body.append(h('div', {}, kv('Name', info.name || '—', { bold: true, big: true }), info.org ? kv('Organisation', info.org) : null, info.title ? kv('Title', info.title) : null,
       ...info.phones.map(p => kv('Phone', p)), ...info.emails.map(e => kv('Email', e)), ...info.urls.map(u => kv('Website', u)), info.address ? kv('Address', info.address) : null));
-    const vcard = /^BEGIN:VCARD/i.test(raw) ? raw : buildVcard({ name: info.name || 'Contact', phone: info.phones[0] || '', email: info.emails[0] || '', org: info.org });
+    const vcard = /^BEGIN:VCARD/i.test(raw) ? raw : buildVcard({ name: info.name || 'Contact', phones: info.phones, emails: info.emails, org: info.org,
+      urls: info.urls, address: info.address, title: info.title });
     const save = button('Save to contacts (.vcf)', () => download(new Blob([vcard], { type: 'text/vcard' }), `${safeName(info.name || 'contact')}.vcf`));
     save.style.flex = '1 1 100%'; acts.append(save);
   } else if (info.kind === 'phone') {

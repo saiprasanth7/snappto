@@ -270,26 +270,31 @@ export async function maskedBlurField(rgba, W, H, alpha, sigma, y_ = NOY) {
 
 /* ── sharpen & levels ── */
 
-/** 3×3 unsharp mask: p + amount·(p − blur3x3(p)), skipping |diff| ≤ threshold (keeps noise down). RGB only; alpha copied. */
-export async function unsharp3(src, w, h, amount = 0.6, threshold = 2, y_ = NOY) {
-  const out = new Uint8ClampedArray(src.length), W4 = w * 4;
+/**
+ * 3×3 unsharp mask, in place: p + amount·(p − blur3x3(p)), skipping |diff| ≤ threshold
+ * (keeps noise down). RGB only; alpha untouched. Keeps just two original rows aside, so a
+ * 16 MP photo needs no second full-size buffer. Returns px.
+ */
+export async function unsharp3(px, w, h, amount = 0.6, threshold = 2, y_ = NOY) {
+  const W4 = w * 4;
+  let above = px.slice(0, W4), cur = px.slice(0, W4);   // original rows y−1 and y
   for (let y = 0; y < h; y++) {
-    const ym = (y > 0 ? y - 1 : 0) * W4, y0 = y * W4, yp = (y < h - 1 ? y + 1 : y) * W4;
+    const y0 = y * W4, below = y < h - 1 ? px.subarray(y0 + W4, y0 + 2 * W4) : cur;   // row y+1 is still original
     for (let x = 0; x < w; x++) {
       const xm = (x > 0 ? x - 1 : 0) * 4, x0 = x * 4, xp = (x < w - 1 ? x + 1 : x) * 4;
       for (let c = 0; c < 3; c++) {
-        const p = src[y0 + x0 + c];
-        const b = (src[ym + xm + c] + 2 * src[ym + x0 + c] + src[ym + xp + c] +
-          2 * src[y0 + xm + c] + 4 * p + 2 * src[y0 + xp + c] +
-          src[yp + xm + c] + 2 * src[yp + x0 + c] + src[yp + xp + c]) / 16;
+        const p = cur[x0 + c];
+        const b = (above[xm + c] + 2 * above[x0 + c] + above[xp + c] +
+          2 * cur[xm + c] + 4 * p + 2 * cur[xp + c] +
+          below[xm + c] + 2 * below[x0 + c] + below[xp + c]) / 16;
         const d = p - b;
-        out[y0 + x0 + c] = d > threshold || d < -threshold ? p + amount * d : p;
+        px[y0 + x0 + c] = d > threshold || d < -threshold ? p + amount * d : p;
       }
-      out[y0 + x0 + 3] = src[y0 + x0 + 3];
     }
+    if (y < h - 1) { const t = above; above = cur; cur = t; cur.set(below); }
     if ((y & 15) === 15) await y_();
   }
-  return out;
+  return px;
 }
 
 function percentile(hist, total, p) {
@@ -522,6 +527,12 @@ export function describeOrient(M) {
 /* ── photo metadata (EXIF / GPS / XMP / IPTC) ── */
 
 const TYPE_SIZE = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8 };
+/**
+ * EXIF tags that only describe the pixels (size, resolution, colour space, orientation).
+ * Safari's own JPEG/PNG encoder always writes a small EXIF block with a few of these.
+ */
+const PLAIN_TAGS = new Set([0x0100, 0x0101, 0x0102, 0x0103, 0x0106, 0x0112, 0x0115, 0x011a, 0x011b, 0x0128, 0x0213,
+  0x8769, 0x9000, 0x9101, 0xa000, 0xa001, 0xa002, 0xa003]);
 const ascii = (u8, o, n) => { let s = ''; for (let i = 0; i < n && o + i < u8.length; i++) s += String.fromCharCode(u8[o + i]); return s; };
 function indexOfBytes(u8, str, from = 0, to = u8.length) {
   const f = str.charCodeAt(0), L = str.length;
@@ -541,7 +552,6 @@ function parseTiff(u8, t0, end, r) {
   const u16 = o => (le ? u8[o] | (u8[o + 1] << 8) : (u8[o] << 8) | u8[o + 1]);
   const u32 = o => (le ? (u8[o] | (u8[o + 1] << 8) | (u8[o + 2] << 16) | (u8[o + 3] << 24)) : ((u8[o] << 24) | (u8[o + 1] << 16) | (u8[o + 2] << 8) | u8[o + 3])) >>> 0;
   if (u16(t0 + 2) !== 42) return;
-  r.exif = true;
   const ifd = off => {
     const o = t0 + off;
     if (!off || o + 2 > end) return null;
@@ -553,6 +563,7 @@ function parseTiff(u8, t0, end, r) {
       const type = u16(e + 2), count = u32(e + 4), size = (TYPE_SIZE[type] || 1) * count;
       map.set(u16(e), { type, count, at: size <= 4 ? e + 8 : t0 + u32(e + 8) });
     }
+    map.next = o + 2 + cnt * 12 + 4 <= end ? u32(o + 2 + cnt * 12) : 0;   // next IFD (IFD1 = thumbnail)
     return map;
   };
   const str = ent => {
@@ -565,7 +576,7 @@ function parseTiff(u8, t0, end, r) {
   const ptr = ent => (ent && ent.at + 4 <= end ? u32(ent.at) : 0);
 
   const ifd0 = ifd(u32(t0 + 4));
-  if (!ifd0) return;
+  if (!ifd0) { r.exif = true; return; }
   r.make = r.make || str(ifd0.get(0x010f));
   r.model = r.model || str(ifd0.get(0x0110));
   r.software = r.software || str(ifd0.get(0x0131));
@@ -573,6 +584,9 @@ function parseTiff(u8, t0, end, r) {
   const ex = ifd(ptr(ifd0.get(0x8769)));
   if (ex) taken = str(ex.get(0x9003)) || taken;
   r.taken = r.taken || taken;
+  // Count the block only when it says more than the pixel basics, or carries a thumbnail.
+  const plain = m => [...m.keys()].every(t => PLAIN_TAGS.has(t));
+  if (!plain(ifd0) || ifd0.next || (ifd0.has(0x8769) && !(ex && plain(ex)))) r.exif = true;
   const g = ifd(ptr(ifd0.get(0x8825)));
   if (g) {
     const la = g.get(2), lo = g.get(4);
@@ -593,6 +607,24 @@ function xmpGps(u8, s, e, r) {
   if (indexOfBytes(u8, 'GPSLatitude', s, e) >= 0 || indexOfBytes(u8, 'GPSLongitude', s, e) >= 0) r.gps = true;
 }
 
+/**
+ * Does a JPEG APP13 (Photoshop) segment hold anything? Safari's encoder writes one with
+ * an empty IPTC record (8BIM 0x0404, length 0) plus its digest (0x0425); that is not data.
+ */
+function app13HasData(u8, s, e) {
+  if (ascii(u8, s, 14) !== 'Photoshop 3.0\0') return true;
+  let p = s + 14;
+  while (p + 12 <= e) {
+    if (ascii(u8, p, 4) !== '8BIM') return true;
+    const id = (u8[p + 4] << 8) | u8[p + 5], q = p + 6 + ((u8[p + 6] + 2) & ~1);   // skip the even-padded Pascal name
+    if (q + 4 > e) return true;
+    const len = ((u8[q] << 24) | (u8[q + 1] << 16) | (u8[q + 2] << 8) | u8[q + 3]) >>> 0;
+    if (id !== 0x0425 && !(id === 0x0404 && len === 0)) return true;
+    p = q + 4 + len + (len & 1);
+  }
+  return false;
+}
+
 /** What kind of file the bytes really are. */
 export function sniffImage(u8) {
   if (u8[0] === 0xff && u8[1] === 0xd8 && u8[2] === 0xff) return 'JPEG';
@@ -605,6 +637,8 @@ export function sniffImage(u8) {
 
 /**
  * Scan image bytes for privacy-relevant metadata. Never throws.
+ * exif / iptc are only set when those blocks hold more than an encoder's own basics
+ * (pixel size, colour space, an empty IPTC record), so a clean re-save reads as clean.
  * → {format, exif, gps, lat, lon, make, model, software, taken, xmp, iptc, comment, text}
  */
 export function parseMeta(u8) {
@@ -625,7 +659,7 @@ export function parseMeta(u8) {
         if (m === 0xe1) {
           if (ascii(u8, s, 6) === 'Exif\0\0') parseTiff(u8, s + 6, e, r);
           else if (ascii(u8, s, 28) === 'http://ns.adobe.com/xap/1.0/') xmpGps(u8, s, e, r);
-        } else if (m === 0xed) r.iptc = true;
+        } else if (m === 0xed) { if (app13HasData(u8, s, e)) r.iptc = true; }
         else if (m === 0xfe) r.comment = true;
         p += 2 + len;
       }

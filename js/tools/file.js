@@ -41,6 +41,8 @@ const ZIP_MSG = {
   notzip: 'This doesn’t look like a ZIP file.',
   truncated: 'This ZIP looks incomplete or damaged — the download may have been cut off. Try downloading it again.',
   corrupt: 'This ZIP is damaged and can’t be read.',
+  locked: 'This file is password-protected.',
+  method: 'This file uses a compression type that can’t be opened here.',
 };
 /**
  * List entries without unpacking anything.
@@ -108,6 +110,114 @@ export function parseExpectedHash(s) {
 }
 export const toHex = buf => Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2, '0')).join('');
 
+// ── streaming SHA-1 / SHA-256 / SHA-512 ─────────────────────────────
+// WebCrypto can only hash one whole buffer (and copies it), which crashes phone tabs on big files.
+// These take the file piece by piece, so memory stays flat at any size.
+/** First 64 bits of the fractional part of p^(1/n): the SHA-2 constants (FIPS 180-4 §4.2.3, §5.3.5), derived instead of pasted. */
+function rootFrac(p, n) {
+  const N = BigInt(n), X = BigInt(p) << (64n * N);
+  let x = 1n << BigInt(Math.ceil((p.toString(2).length + 64 * n) / n));   // above the root; Newton steps down to floor(root)
+  for (;;) { const y = ((N - 1n) * x + X / x ** (N - 1n)) / N; if (y >= x) break; x = y; }
+  return x & 0xffffffffffffffffn;
+}
+let SHA2 = null;
+function sha2Consts() {
+  if (SHA2) return SHA2;
+  const primes = []; for (let k = 2; primes.length < 80; k++) if (primes.every(p => k % p)) primes.push(k);
+  const hi = v => Number(v >> 32n) | 0, lo = v => Number(v & 0xffffffffn) | 0;
+  const K = primes.map(p => rootFrac(p, 3)), H = primes.slice(0, 8).map(p => rootFrac(p, 2));
+  return (SHA2 = { K256: Int32Array.from(K.slice(0, 64), hi), H256: Int32Array.from(H, hi),
+    K512: Int32Array.from(K.flatMap(v => [hi(v), lo(v)])), H512: Int32Array.from(H.flatMap(v => [hi(v), lo(v)])) });
+}
+const be32 = (b, o) => (b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3];
+function sha1Block(H, b, o, W) {
+  for (let t = 0; t < 16; t++, o += 4) W[t] = be32(b, o);
+  for (let t = 16; t < 80; t++) { const x = W[t - 3] ^ W[t - 8] ^ W[t - 14] ^ W[t - 16]; W[t] = (x << 1) | (x >>> 31); }
+  let a = H[0], bb = H[1], c = H[2], d = H[3], e = H[4];
+  for (let t = 0; t < 80; t++) {
+    const f = t < 20 ? (bb & c) | (~bb & d) : t < 40 ? bb ^ c ^ d : t < 60 ? (bb & c) | (bb & d) | (c & d) : bb ^ c ^ d;
+    const k = t < 20 ? 0x5a827999 : t < 40 ? 0x6ed9eba1 : t < 60 ? 0x8f1bbcdc : 0xca62c1d6;
+    const x = (((a << 5) | (a >>> 27)) + f + e + k + W[t]) | 0;
+    e = d; d = c; c = (bb << 30) | (bb >>> 2); bb = a; a = x;
+  }
+  H[0] = (H[0] + a) | 0; H[1] = (H[1] + bb) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0; H[4] = (H[4] + e) | 0;
+}
+function sha256Block(H, b, o, W) {
+  const K = SHA2.K256;
+  for (let t = 0; t < 16; t++, o += 4) W[t] = be32(b, o);
+  for (let t = 16; t < 64; t++) {
+    const x = W[t - 15], y = W[t - 2];
+    W[t] = ((((x >>> 7) | (x << 25)) ^ ((x >>> 18) | (x << 14)) ^ (x >>> 3)) + (((y >>> 17) | (y << 15)) ^ ((y >>> 19) | (y << 13)) ^ (y >>> 10)) + W[t - 7] + W[t - 16]) | 0;
+  }
+  let a = H[0], bb = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+  for (let t = 0; t < 64; t++) {
+    const t1 = (h + (((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7))) + ((e & f) ^ (~e & g)) + K[t] + W[t]) | 0;
+    const t2 = ((((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10))) + ((a & bb) ^ (a & c) ^ (bb & c))) | 0;
+    h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = bb; bb = a; a = (t1 + t2) | 0;
+  }
+  H[0] = (H[0] + a) | 0; H[1] = (H[1] + bb) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
+  H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+}
+// SHA-512 words are 64-bit, held as (hi, lo) pairs of 32-bit ints; carries go through the lo sums.
+function sha512Block(H, b, o, W) {
+  const K = SHA2.K512;
+  for (let t = 0; t < 32; t++, o += 4) W[t] = be32(b, o);
+  for (let t = 32; t < 160; t += 2) {
+    const xh = W[t - 30], xl = W[t - 29], yh = W[t - 4], yl = W[t - 3];
+    const s0h = ((xh >>> 1) | (xl << 31)) ^ ((xh >>> 8) | (xl << 24)) ^ (xh >>> 7);
+    const s0l = ((xl >>> 1) | (xh << 31)) ^ ((xl >>> 8) | (xh << 24)) ^ ((xl >>> 7) | (xh << 25));
+    const s1h = ((yh >>> 19) | (yl << 13)) ^ ((yl >>> 29) | (yh << 3)) ^ (yh >>> 6);
+    const s1l = ((yl >>> 19) | (yh << 13)) ^ ((yh >>> 29) | (yl << 3)) ^ ((yl >>> 6) | (yh << 26));
+    const l = (s0l >>> 0) + (s1l >>> 0) + (W[t - 13] >>> 0) + (W[t - 31] >>> 0);
+    W[t] = (s0h + s1h + W[t - 14] + W[t - 32] + ((l / 0x100000000) | 0)) | 0; W[t + 1] = l | 0;
+  }
+  let ah = H[0], al = H[1], bh = H[2], bl = H[3], ch = H[4], cl = H[5], dh = H[6], dl = H[7];
+  let eh = H[8], el = H[9], fh = H[10], fl = H[11], gh = H[12], gl = H[13], hh = H[14], hl = H[15];
+  for (let t = 0; t < 160; t += 2) {
+    const S1h = ((eh >>> 14) | (el << 18)) ^ ((eh >>> 18) | (el << 14)) ^ ((el >>> 9) | (eh << 23));
+    const S1l = ((el >>> 14) | (eh << 18)) ^ ((el >>> 18) | (eh << 14)) ^ ((eh >>> 9) | (el << 23));
+    const chh = (eh & fh) ^ (~eh & gh), chl = (el & fl) ^ (~el & gl);
+    const l1 = (hl >>> 0) + (S1l >>> 0) + (chl >>> 0) + (K[t + 1] >>> 0) + (W[t + 1] >>> 0);
+    const t1h = (hh + S1h + chh + K[t] + W[t] + ((l1 / 0x100000000) | 0)) | 0, t1l = l1 | 0;
+    const S0h = ((ah >>> 28) | (al << 4)) ^ ((al >>> 2) | (ah << 30)) ^ ((al >>> 7) | (ah << 25));
+    const S0l = ((al >>> 28) | (ah << 4)) ^ ((ah >>> 2) | (al << 30)) ^ ((ah >>> 7) | (al << 25));
+    const mjh = (ah & bh) ^ (ah & ch) ^ (bh & ch), mjl = (al & bl) ^ (al & cl) ^ (bl & cl);
+    const l2 = (S0l >>> 0) + (mjl >>> 0);
+    const t2h = (S0h + mjh + ((l2 / 0x100000000) | 0)) | 0, t2l = l2 | 0;
+    hh = gh; hl = gl; gh = fh; gl = fl; fh = eh; fl = el;
+    const l3 = (dl >>> 0) + (t1l >>> 0); eh = (dh + t1h + ((l3 / 0x100000000) | 0)) | 0; el = l3 | 0;
+    dh = ch; dl = cl; ch = bh; cl = bl; bh = ah; bl = al;
+    const l4 = (t1l >>> 0) + (t2l >>> 0); ah = (t1h + t2h + ((l4 / 0x100000000) | 0)) | 0; al = l4 | 0;
+  }
+  const v = [ah, al, bh, bl, ch, cl, dh, dl, eh, el, fh, fl, gh, gl, hh, hl];
+  for (let i = 0; i < 16; i += 2) { const l = (H[i + 1] >>> 0) + (v[i + 1] >>> 0); H[i] = (H[i] + v[i] + ((l / 0x100000000) | 0)) | 0; H[i + 1] = l | 0; }
+}
+/** Incremental hasher: update(Uint8Array) as often as needed, then hex(). alg: 'SHA-1' | 'SHA-256' | 'SHA-512'. */
+export function shaStream(alg) {
+  sha2Consts();
+  const [block, H, W, size] = {
+    'SHA-1': [sha1Block, Int32Array.of(0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0), new Int32Array(80), 64],
+    'SHA-256': [sha256Block, SHA2.H256.slice(), new Int32Array(64), 64],
+    'SHA-512': [sha512Block, SHA2.H512.slice(), new Int32Array(160), 128] }[alg];
+  const buf = new Uint8Array(size);
+  let fill = 0, total = 0;
+  const update = u8 => {
+    let i = 0;
+    total += u8.length;
+    if (fill) { i = Math.min(size - fill, u8.length); buf.set(u8.subarray(0, i), fill); fill += i; if (fill < size) return; block(H, buf, 0, W); fill = 0; }
+    for (; i + size <= u8.length; i += size) block(H, u8, i, W);
+    if (i < u8.length) { buf.set(u8.subarray(i)); fill = u8.length - i; }
+  };
+  const hex = () => {
+    const bits = total * 8, tail = new Uint8Array((fill + 1 + size / 8 > size ? 2 : 1) * size - fill);
+    tail[0] = 0x80;
+    for (let k = 1; k <= 6; k++) tail[tail.length - k] = Math.floor(bits / 2 ** (8 * (k - 1))) & 255;   // bit length, big-endian
+    update(tail);
+    return Array.from(H, x => (x >>> 0).toString(16).padStart(8, '0')).join('');
+  };
+  return { update, hex };
+}
+
 // ── file type detection ─────────────────────────────────────────────
 const T = (label, mime, exts, kind, extra = {}) => ({ label, mime, exts, kind, ...extra });
 const TEXTY = new Set(['txt', 'text', 'csv', 'tsv', 'md', 'markdown', 'log', 'json', 'xml', 'html', 'htm', 'js', 'mjs', 'css', 'py', 'java', 'c', 'h', 'cpp', 'ts', 'sh',
@@ -132,6 +242,13 @@ export function zipFlavour(names = [], head) {
   if (any(/^base\/manifest\/AndroidManifest\.xml$/)) return T('Android app bundle (AAB)', 'application/octet-stream', ['aab'], 'program', { danger: true });
   if (any(/^Payload\/[^/]+\.app\//)) return T('iPhone app (IPA)', 'application/octet-stream', ['ipa'], 'program', { danger: true });
   if (has('META-INF/MANIFEST.MF') && any(/\.class$/)) return T('Java archive (JAR)', 'application/java-archive', ['jar'], 'program', { danger: true });
+  // iWork (iPhone / Mac Pages, Numbers, Keynote) and AR models are plain ZIPs inside.
+  if (any(/^Index\/(Template)?Slide[^/]*\.iwa$/)) return T('Keynote presentation', 'application/vnd.apple.keynote', ['key'], 'document');
+  if (any(/^Index\/[^/]+\.iwa$/))
+    return T('Pages or Numbers document', 'application/vnd.apple.pages', any(/^Index\/Tables\//) ? ['numbers', 'pages'] : ['pages', 'numbers'], 'document');
+  // Older iWork files keep their parts in a nested Index.zip, so the app can't be told apart here.
+  if (has('Index.zip') && has('Metadata/Properties.plist')) return T('Apple iWork document (Pages, Numbers or Keynote)', 'application/zip', ['pages', 'numbers', 'key'], 'document');
+  if (names.length && /\.usd[ac]?$/i.test(names[0])) return T('3D / AR model (USDZ)', 'model/vnd.usdz+zip', ['usdz'], 'document');
   if (has('doc.kml')) return T('Google Earth file (KMZ)', 'application/vnd.google-earth.kmz', ['kmz'], 'document');
   if (any(/^visio\//)) return T('Visio drawing', 'application/vnd.ms-visio.drawing', ['vsdx'], 'document');
   return T('ZIP archive', 'application/zip', ['zip'], 'archive', names.length ? { note: `${names.filter(n => !/\/$/.test(n)).length} file(s) inside — open it with “Open ZIP”.` } : {});
@@ -171,7 +288,13 @@ export function detectType(b, info = {}) {
     if (brand === 'M4V ' || brand === 'M4VH' || brand === 'M4VP') return T('MP4 video', 'video/x-m4v', ['m4v', 'mp4'], 'video');
     return T('MP4 video', 'video/mp4', ['mp4', 'm4v', 'mov'], 'video');
   }
-  if (['moov', 'mdat', 'wide', 'free', 'skip', 'pnot'].includes(str(4, 4)) && b.length > 8) return T('QuickTime video (MOV)', 'video/quicktime', ['mov', 'mp4'], 'video');
+  if (['moov', 'mdat', 'wide', 'free', 'skip', 'pnot'].includes(str(4, 4)) && b.length > 8) {
+    // Only trust the atom name when its size fits the file: text like "For free…" has a size word of ~1 GB.
+    // Without the file size, a size word that is all printable letters is taken as text.
+    const sz = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
+    const texty = [0, 1, 2, 3].every(i => b[i] >= 0x20 && b[i] < 0x7f);
+    if (sz === 0 || sz === 1 || (sz >= 8 && (info.size ? sz <= info.size : !texty))) return T('QuickTime video (MOV)', 'video/quicktime', ['mov', 'mp4'], 'video');
+  }
   if (ascii(0, 'BM') && b.length > 26 && (b[6] | b[7] | b[8] | b[9]) === 0) return T('BMP image', 'image/bmp', ['bmp', 'dib'], 'image');
   if (at(0, 0x49, 0x49, 0x2A, 0x00) || at(0, 0x4D, 0x4D, 0x00, 0x2A) || at(0, 0x49, 0x49, 0x2B, 0x00) || at(0, 0x4D, 0x4D, 0x00, 0x2B)) {
     if (ascii(8, 'CR')) return T('Canon RAW photo (CR2)', 'image/x-canon-cr2', ['cr2'], 'image');
@@ -224,7 +347,9 @@ export function detectType(b, info = {}) {
   if (ascii(0, 'wOFF')) return T('Web font (WOFF)', 'font/woff', ['woff'], 'font');
   if (ascii(0, 'wOF2')) return T('Web font (WOFF2)', 'font/woff2', ['woff2'], 'font');
   if (ascii(0, 'OTTO')) return T('OpenType font', 'font/otf', ['otf'], 'font');
-  if (at(0, 0x00, 0x01, 0x00, 0x00) && b.length > 12 && u16(b, 4) > 0 && u16(b, 4) < 64 && b[4] === 0) return T('TrueType font', 'font/ttf', ['ttf'], 'font');
+  const numTables = (b[4] << 8) | b[5];                                   // big-endian, unlike the ZIP fields
+  if ((at(0, 0x00, 0x01, 0x00, 0x00) || ascii(0, 'true')) && b.length > 12 && numTables > 0 && numTables < 64) return T('TrueType font', 'font/ttf', ['ttf'], 'font');
+  if (ascii(0, 'ttcf') && (at(4, 0, 1, 0, 0) || at(4, 0, 2, 0, 0))) return T('TrueType font collection', 'font/collection', ['ttc'], 'font');
   if (ascii(0x8001, 'CD001')) return T('Disc image (ISO)', 'application/x-iso9660-image', ['iso'], 'archive');
   return detectText(b, info);
 }
@@ -283,7 +408,8 @@ export function extensionCheck(fileName, det) {
   if (det.exts.includes(ext)) return null;
   if (det.kind === 'text' && TEXTY.has(ext) && !det.danger) return null;
   if (det.mime === 'video/mp4' && ['mp4', 'm4v', 'mov', 'm4a', '3gp'].includes(ext)) return null;
-  if (det.mime === 'application/zip' && ['zip', 'cbz', 'zipx', 'xpi', 'crx', 'whl', 'nupkg', 'vsix', 'sketch', 'pbix', 'mcpack'].includes(ext)) return null;
+  if (det.mime === 'application/zip' && ['zip', 'cbz', 'zipx', 'xpi', 'crx', 'whl', 'nupkg', 'vsix', 'sketch', 'pbix', 'mcpack',
+    'pages', 'numbers', 'key', 'usdz', '3mf', 'ora', 'kra'].includes(ext)) return null;
   if (det.danger || det.kind === 'program') return { lvl: 'err', msg: `Careful: this is really a ${det.label}, but it’s named “.${ext}”. Disguised programs are a common trick — don’t open or install it unless you trust where it came from.` };
   return { lvl: 'warn', msg: `It’s named “.${ext}” but it’s really a ${det.label}. Renaming it to “.${det.exts[0]}” may help it open.` };
 }
@@ -325,12 +451,24 @@ const MIME_BY_EXT = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', g
 export const mimeFromName = n => MIME_BY_EXT[extOf(n)] || 'application/octet-stream';
 
 // ── packing & hashing (work on File/Blob objects; streamed in chunks) ──
+// Output is handed to Blob parts every 16 MB, so the JS heap never holds a whole archive.
+const FLUSH = 16 * 2 ** 20;
+/**
+ * Biggest ZIP we build, or deflated entry we unpack, in one go. The result is a Blob the browser keeps in memory
+ * until it is saved, and a phone tab is killed long before a computer's (stored entries are file slices: no limit).
+ */
+export const zipMemLimit = () => (typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches ? 500 : 1536) * 2 ** 20;
+
 /** Stream files into a ZIP (deflate level 6; already-compressed formats stored). → {blob, stored}. */
 export async function zipFiles(files, fflate, onProgress = () => {}, yieldFn = tick) {
   const total = files.reduce((a, f) => a + f.size, 0);
   const names = uniqueNames(files.map(f => f.name));
-  const chunks = []; let zipErr = null;
-  const zip = new fflate.Zip((err, data) => { if (err) zipErr = err; else chunks.push(data); });
+  const parts = []; let chunks = [], held = 0, zipErr = null;
+  const zip = new fflate.Zip((err, data) => {
+    if (err) { zipErr = err; return; }
+    chunks.push(data); held += data.length;
+    if (held >= FLUSH) { parts.push(new Blob(chunks)); chunks = []; held = 0; }
+  });
   let done = 0, stored = 0;
   for (let i = 0; i < files.length; i++) {
     const f = files[i], packed = isPackedName(names[i]);
@@ -354,31 +492,52 @@ export async function zipFiles(files, fflate, onProgress = () => {}, yieldFn = t
   }
   zip.end();
   if (zipErr) throw zipErr;
-  return { blob: new Blob(chunks, { type: 'application/zip' }), stored, names };
+  return { blob: new Blob([...parts, ...chunks], { type: 'application/zip' }), stored, names };
 }
 
-/** MD5 (incremental, any size) + SHA-1/256/512 via WebCrypto (whole file in memory, up to shaMax). */
-export async function hashFile(f, { SparkMD5, subtle, shaMax = 700 * 2 ** 20, onProgress = () => {}, cancelled = () => false, yieldFn = tick }) {
+/**
+ * Unpack one entry straight from the ZIP File, reading only that entry's bytes:
+ * stored entries are a zero-copy slice, deflated ones stream through fflate in 1 MB pieces.
+ */
+export async function extractEntry(file, entry, fflate, yieldFn = tick) {
+  if (entry.encrypted) throw new ZipError('locked', ZIP_MSG.locked);
+  if (entry.method !== 0 && entry.method !== 8) throw new ZipError('method', ZIP_MSG.method);
+  const lh = new Uint8Array(await file.slice(entry.offset, entry.offset + 30).arrayBuffer());
+  if (lh.length < 30 || u32(lh, 0) !== 0x04034b50) throw new ZipError('corrupt', ZIP_MSG.corrupt);
+  const start = entry.offset + 30 + u16(lh, 26) + u16(lh, 28), end = start + entry.csize;   // the local header's own name/extra lengths
+  if (end > file.size) throw new ZipError('truncated', ZIP_MSG.truncated);
+  const base = entry.name.split('/').pop() || 'file', type = mimeFromName(base);
+  if (entry.method === 0 || !entry.csize) return new File([file.slice(start, end)], base, { type });
+  const parts = []; let chunks = [], held = 0;
+  const inf = new fflate.Inflate(d => {
+    chunks.push(d); held += d.length;
+    if (held >= FLUSH) { parts.push(new Blob(chunks)); chunks = []; held = 0; }
+  });
+  const CH = 2 ** 20;
+  for (let off = start; off < end; off += CH) {
+    const piece = new Uint8Array(await file.slice(off, Math.min(end, off + CH)).arrayBuffer());
+    try { inf.push(piece, off + CH >= end); } catch (e) { throw e instanceof RangeError ? e : new ZipError('corrupt', ZIP_MSG.corrupt); }
+    await yieldFn();
+  }
+  return new File([...parts, ...chunks], base, { type });
+}
+
+/** MD5 + SHA-1/256/512 in one streamed pass (1 MB at a time), so any size works in flat memory. */
+export async function hashFile(f, { SparkMD5, onProgress = () => {}, cancelled = () => false, yieldFn = tick }) {
   const md5 = new SparkMD5.ArrayBuffer();
-  const doSha = !!subtle && f.size <= shaMax;
-  const whole = doSha ? new Uint8Array(f.size) : null;
-  const CH = 4 * 2 ** 20;
+  const sha = [['sha1', shaStream('SHA-1')], ['sha256', shaStream('SHA-256')], ['sha512', shaStream('SHA-512')]];
+  const CH = 2 ** 20;
   for (let off = 0; off < f.size; off += CH) {
     const buf = await f.slice(off, off + CH).arrayBuffer();
     if (cancelled()) return null;
     md5.append(buf);
-    if (whole) whole.set(new Uint8Array(buf), off);
-    onProgress(Math.min(1, (off + buf.byteLength) / f.size) * (doSha ? 0.6 : 1), 'MD5');
+    const u8 = new Uint8Array(buf);
+    for (const [, s] of sha) s.update(u8);
+    onProgress(Math.min(1, (off + buf.byteLength) / f.size));
     await yieldFn();
   }
   const r = { md5: md5.end() };
-  if (doSha) {
-    let k = 0;
-    for (const [key, alg] of [['sha1', 'SHA-1'], ['sha256', 'SHA-256'], ['sha512', 'SHA-512']]) {
-      onProgress(0.6 + 0.4 * (k++ / 3), alg); await yieldFn();
-      r[key] = toHex(await subtle.digest(alg, whole));
-    }
-  } else r.why = !subtle ? 'Needs a secure (https) page' : `Skipped — file is over ${Math.round(shaMax / 2 ** 20)} MB`;
+  for (const [key, s] of sha) r[key] = s.hex();
   return cancelled() ? null : r;
 }
 
@@ -416,8 +575,8 @@ function mountZip(root) {
   const go = button('Create ZIP', () => busy(go, async () => {
     out.replaceChildren();
     if (!files.length) { out.append(notice('Choose at least one file first.', 'warn')); return; }
-    const total = files.reduce((a, f) => a + f.size, 0);
-    if (total > 1.5 * 2 ** 30) { out.append(notice('That’s more than 1.5 GB — too much to zip inside a phone browser. Try fewer files.', 'warn')); return; }
+    const total = files.reduce((a, f) => a + f.size, 0), max = zipMemLimit();
+    if (total > max) { out.append(notice(`That’s ${fmtBytes(total)} of files. This browser can zip up to ${fmtBytes(max)} at a time, so try fewer files or make two ZIPs.`, 'warn')); return; }
     const p = progress('Packing…'); out.append(p.el);
     try {
       const fflate = await libs.fflate();
@@ -426,7 +585,11 @@ function mountZip(root) {
       const base = (name.value.trim() || 'archive').replace(/\.zip$/i, '').replace(/[\\/:*?"<>|]+/g, '_');
       out.append(await resultCard({ title: 'ZIP ready', blob, filename: `${base}.zip`, before: total, after: blob.size,
         note: `${files.length} file${files.length === 1 ? '' : 's'}${stored ? ` · ${stored} photo/video/compressed file${stored === 1 ? ' was' : 's were'} stored as-is (they’re already compressed)` : ''}` }));
-    } catch (e) { console.error(e); p.fail(e.message && !/^\d+$/.test(e.message) ? e.message : 'Couldn’t create the ZIP. Try fewer or smaller files.'); }
+    } catch (e) {
+      console.error(e);
+      p.fail(/memory|allocation|RangeError/i.test(String(e && (e.name + e.message))) ? 'The phone ran out of memory making this ZIP. Try fewer or smaller files.'
+        : e.message && !/^\d+$/.test(e.message) ? e.message : 'Couldn’t create the ZIP. Try fewer or smaller files.');
+    }
   }), { full: true });
   root.append(card({ title: 'Files to pack' }, picker, info), card({}, name.el), go, out);
 }
@@ -441,17 +604,10 @@ function mountUnzip(root) {
 
   async function open(file) {
     out.replaceChildren();
-    if (file.size > 2 * 2 ** 30) { out.append(notice('That ZIP is over 2 GB — too big to open inside a phone browser.', 'warn')); return; }
     const p = progress('Reading the ZIP…'); out.append(p.el);
-    let u8, entries;
+    let entries;
     try {
-      u8 = new Uint8Array(file.size);
-      const CH = 8 * 2 ** 20;
-      for (let off = 0; off < file.size; off += CH) {
-        u8.set(new Uint8Array(await file.slice(off, off + CH).arrayBuffer()), off);
-        if (file.size > CH) { p.set(Math.min(1, (off + CH) / file.size)); await tick(); }
-      }
-      entries = await listZip(u8);
+      entries = await readZipDirectory(fileReader(file), file.size);    // only the directory is read; entries are read when saved
     } catch (e) {
       p.fail(e instanceof ZipError ? e.message : 'Couldn’t read that file. If it’s in iCloud, download it to the phone first.');
       return;
@@ -465,22 +621,21 @@ function mountUnzip(root) {
     const total = items.reduce((a, e) => a + e.size, 0);
     const locked = items.filter(e => e.encrypted).length;
 
-    const extract = entry => {
-      if (entry.encrypted) throw new Error('This file is password-protected.');
-      if (entry.method !== 0 && entry.method !== 8) throw new Error('This file uses a compression type that can’t be opened here.');
-      if (entry.size > 1.5 * 2 ** 30) throw new Error('This file is too big to unpack on a phone.');
-      let k = -1;
-      const res = fflate.unzipSync(u8, { filter: () => ++k === entry.index });
-      const data = Object.values(res)[0];
-      if (!data) throw new Error('Couldn’t find that file inside the ZIP.');
-      const base = entry.name.split('/').pop() || 'file';
-      return new File([data], base, { type: mimeFromName(base) });
+    const extract = async entry => {
+      const max = zipMemLimit();
+      if (entry.method === 8 && entry.size > max) throw new Error(`This file is ${fmtBytes(entry.size)} unpacked. This browser can unpack up to ${fmtBytes(max)} at a time.`);
+      try { return await extractEntry(file, entry, fflate); }
+      catch (e) {
+        if (e instanceof ZipError) throw e;
+        throw new Error(/memory|allocation|RangeError/i.test(String(e && (e.name + e.message))) ? 'The phone ran out of memory unpacking this file.'
+          : 'Couldn’t read that file. If it’s in iCloud, download it to the phone first.');
+      }
     };
     const act = async (entry, how, btn) => {
       try {
         btn.disabled = true;
         await tick();
-        const f = extract(entry);
+        const f = await extract(entry);
         if (how === 'share') await share(f, f.name); else download(f, f.name);
       } catch (e) { toast(e.message || 'Couldn’t unpack that file', 'err'); }
       finally { btn.disabled = false; }
@@ -517,9 +672,8 @@ function mountUnzip(root) {
     const shareAll = canShareFiles() && items.length > 1 && items.length <= 100 && total <= 300 * 2 ** 20 && !locked
       ? button(`Share all ${items.length} files`, () => busy(shareAll, async () => {
         try {
-          let k = -1; const want = new Set(items.map(e => e.index));
-          const res = fflate.unzipSync(u8, { filter: () => want.has(++k) });
-          const fs = Object.entries(res).filter(([n]) => !/\/$/.test(n)).map(([n, d]) => { const b = n.split('/').pop(); return new File([d], b, { type: mimeFromName(b) }); });
+          const fs = [];
+          for (const e of items) fs.push(await extract(e));
           if (navigator.canShare && navigator.canShare({ files: fs })) await navigator.share({ files: fs });
           else toast('This phone can’t share that many files at once — save them one by one', 'err');
         } catch (e) { if (e && e.name !== 'AbortError') toast('Couldn’t share all files — try one at a time', 'err'); }
@@ -546,7 +700,6 @@ function mountHash(root) {
   exp.input.addEventListener('input', () => { judge(); paint(); });
 
   const ALGOS = [['md5', 'MD5'], ['sha1', 'SHA-1'], ['sha256', 'SHA-256'], ['sha512', 'SHA-512']];
-  const SHA_MAX = 700 * 2 ** 20;
   function judge() {
     verdict.replaceChildren();
     const raw = exp.value.trim();
@@ -555,7 +708,6 @@ function mountHash(root) {
     if (!e) { verdict.append(notice('That doesn’t look like an MD5, SHA-1, SHA-256 or SHA-512 checksum.', 'warn')); return; }
     const name = ALGOS.find(a => a[0] === e.algo)[1];
     if (!result) { verdict.append(muted(`Looks like a ${name} checksum. ${file ? 'Calculating…' : 'Now choose the file.'}`)); return; }
-    if (!result[e.algo]) { verdict.append(notice(`${name} isn’t available for this file (see below).`, 'warn')); return; }
     verdict.append(result[e.algo] === e.hex
       ? notice(h('span', {}, h('b', {}, `✅ Match — `), `the ${name} is identical. The file is complete and unchanged.`), 'ok')
       : notice(h('span', {}, h('b', {}, `❌ No match — `), `the ${name} is different. The file may be damaged, incomplete, or a different version. Download it again.`), 'err'));
@@ -571,7 +723,7 @@ function mountHash(root) {
         return h('div', { style: { padding: '10px 12px', borderRadius: '12px', background: hit ? (ok ? 'var(--ok-soft)' : 'var(--err-soft)') : 'var(--surface-2)' } },
           h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px', marginBottom: '4px' } },
             h('b', { class: 'small' }, label + (hit ? (ok ? '  ✅' : '  ❌') : '')), v ? copyButton(v) : null),
-          h('div', { class: 'mono', style: { wordBreak: 'break-all', fontSize: '13px', color: v ? 'var(--text)' : 'var(--faint)' } }, v || result.why || '—'));
+          h('div', { class: 'mono', style: { wordBreak: 'break-all', fontSize: '13px', color: v ? 'var(--text)' : 'var(--faint)' } }, v || '—'));
       })));
   }
   async function run() {
@@ -580,8 +732,8 @@ function mountHash(root) {
     const p = progress('Reading the file…'); out.append(p.el);
     try {
       const SparkMD5 = await libs.SparkMD5();
-      const r = await hashFile(f, { SparkMD5, subtle: globalThis.crypto && crypto.subtle, shaMax: SHA_MAX,
-        onProgress: (fr, alg) => p.set(fr, `Calculating ${alg}…`), cancelled: () => file !== f });
+      // Big files take a while on a phone, so stop when another file is picked or the user leaves.
+      const r = await hashFile(f, { SparkMD5, onProgress: fr => p.set(fr, 'Calculating checksums…'), cancelled: () => file !== f || !root.isConnected });
       if (!r || file !== f) return;                                   // a new file was picked meanwhile
       p.done();
       result = r; paint(); judge();

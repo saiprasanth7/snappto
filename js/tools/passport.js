@@ -20,25 +20,30 @@ import {
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
-/** analyze() thresholds, verbatim from engine/passport_photo.py. */
+/** analyze() thresholds from engine/passport_photo.py, plus the preset room checks. */
 export const CHECK = {
   minSide: 500,      // min(h, w) < 500 → low resolution
   secondFace: 0.30,  // 2nd face area > 30% of the largest → "more than one face"
   faceMin: 0.22,     // face height / image height
   faceMax: 0.60,
+  faceFloor: 0.15,   // lowest "far" bar, for a photo too narrow to fit the chosen size at faceMin (minFace)
+  fitShare: 0.85,    // that bar: this share of the largest face whose crop still fits
   centreTol: 0.14,   // |face centre x − w/2| ≤ 14% of w
   darkMin: 75,       // mean face grey level
   brightMax: 205,
-  topMin: 0.04,      // face box top must be ≥ 4% of h below the top edge
+  topMin: 0.04,      // estimated crown (GEOM.headTop above the face box) must be ≥ 4% of h below the top edge
+  roomTol: 0.03,     // the preset's crop may run past the photo's sides or bottom by ≤ 3% of its size
 };
 
-/** The bot's retake tips (same wording, lightly punctuated). */
+/** The bot's retake tips (same wording, lightly punctuated), plus room and narrow for the chosen size. */
 export const ISSUES = {
   res: '📏 Resolution is low: use the rear camera or move closer.',
   noface: '🙂 I can’t find a clear face: face the camera straight, in good light.',
   multi: '👥 More than one face detected: only you should be in frame.',
   far: '↔️ Too far: bring the camera closer (head and shoulders fill the frame).',
   close: '↔️ Too close: move the phone back so your full head fits.',
+  room: '↔️ Too close for this photo size: move the phone back so your shoulders fit.',
+  narrow: '↔️ This photo is too narrow for this size: white would fill the sides. Choose a wider photo.',
   centre: '🎯 Off-centre: keep your face in the middle of the frame.',
   dark: '💡 Too dark: turn towards a window or light source.',
   bright: '💡 Overexposed: step back from direct light.',
@@ -53,7 +58,8 @@ export const CHECK_LABELS = {
 /** Short prompts for the live camera (preview is mirrored, so no left/right words). */
 export const LIVE_HINTS = {
   noface: 'Show your face inside the oval', multi: 'Only you in the frame, please',
-  far: 'Move a little closer', close: 'Move back a little', centre: 'Centre your face in the oval',
+  far: 'Move a little closer', close: 'Move back a little', room: 'Move back a little', centre: 'Centre your face in the oval',
+  narrow: 'Too wide for the camera: upload a wider photo',
   top: 'Leave a little space above your head', dark: 'Find more light: face a window',
   bright: 'Too bright: step out of direct light', res: 'Hold still', ok: 'Looks good. Tap the button',
 };
@@ -61,10 +67,12 @@ export const LIVE_HINTS = {
 /**
  * Port of analyze(). faces: [{x, y, w, h}] in the analysed image's pixels (any order).
  * opts: {w, h} analysed size, {origW, origH} original size (for the resolution check),
- * brightness(face) → mean grey 0..255 (or null to skip), live: skip the resolution check.
+ * brightness(face) → mean grey 0..255 (or null to skip), live: skip the resolution check,
+ * preset: the chosen size (or null); its crop must fit inside the photo ("room"), a narrow
+ * photo may hold a smaller face (minFace), and one too narrow for any face gets "narrow".
  * Returns {ok, fatal, issues:[{id,msg}], checks:{id:bool}, face, faces, ratio, brightness}.
  */
-export function analyzeFaces(faces, { w, h, origW = w, origH = h, brightness = null, live = false } = {}) {
+export function analyzeFaces(faces, { w, h, origW = w, origH = h, brightness = null, live = false, preset = null } = {}) {
   const issues = [];
   const checks = {};
   const add = id => issues.push({ id, msg: ISSUES[id] });
@@ -86,13 +94,25 @@ export function analyzeFaces(faces, { w, h, origW = w, origH = h, brightness = n
   const f = sorted[0];
 
   const ratio = f.h / h;
-  checks.size = ratio >= CHECK.faceMin && ratio <= CHECK.faceMax;
-  if (ratio < CHECK.faceMin) add('far');
-  else if (ratio > CHECK.faceMax) add('close');
+  if (preset && widestFit(w, h, preset) < CHECK.faceFloor) {
+    checks.size = false; add('narrow');   // no distance gives this size room here: say so once
+  } else {
+    const lo = minFace(w, h, preset);
+    checks.size = ratio >= lo && ratio <= CHECK.faceMax;
+    if (ratio < lo) add('far');
+    else if (ratio > CHECK.faceMax) add('close');
+  }
 
   const cx = f.x + f.w / 2;
   checks.centre = Math.abs(cx - w / 2) <= CHECK.centreTol * w;
   if (!checks.centre) add('centre');
+
+  // A crop bigger than the photo is filled with white, which cuts off the shoulders.
+  if (preset && checks.size && !cropFits(f, w, h, preset)) {
+    // Within the centred fit, only the sideways offset pushes the crop out: say centre, not move back.
+    if (checks.centre && cropOverflow(f, w, h, preset).bottom <= CHECK.roomTol && ratio <= widestFit(w, h, preset)) { checks.centre = false; add('centre'); }
+    else { checks.size = false; add('room'); }
+  }
 
   let b = null;
   if (brightness) {
@@ -104,7 +124,8 @@ export function analyzeFaces(faces, { w, h, origW = w, origH = h, brightness = n
     }
   }
 
-  checks.top = f.y >= CHECK.topMin * h;
+  // Test the crown (as cropRect places it), not the box top: the box starts at the forehead.
+  checks.top = f.y - GEOM.headTop * f.h >= CHECK.topMin * h;
   if (!checks.top) add('top');
 
   return { ok: issues.length === 0, fatal: false, issues, checks, face: f, faces: sorted, ratio, brightness: b };
@@ -143,6 +164,63 @@ export function cropRect(face, preset) {
   const top = headTop - GEOM.above * (cropH - headH);
   const left = (x + fw / 2) - cropW / 2;
   return { left, top, w: cropW, h: cropH, headTop, headH };
+}
+
+/**
+ * How far the preset's crop runs past a W×H photo, as fractions of the crop size (0 = fits):
+ * {left, right, bottom} become white bands in the result; crown > 0 means the hair is cut off.
+ * The space above the head is left out: it is background, which turns white anyway.
+ */
+export function cropOverflow(face, W, H, preset) {
+  const r = cropRect(face, preset);
+  return {
+    left: Math.max(0, -r.left) / r.w,
+    right: Math.max(0, r.left + r.w - W) / r.w,
+    bottom: Math.max(0, r.top + r.h - H) / r.h,
+    crown: Math.max(0, -r.headTop) / r.h,
+  };
+}
+export function cropFits(face, W, H, preset, tol = CHECK.roomTol) {
+  const o = cropOverflow(face, W, H, preset);
+  return o.left <= tol && o.right <= tol && o.bottom <= tol;
+}
+
+/** Largest face (share of the height of a W×H photo) whose centred crop still fits the width. */
+export function widestFit(W, H, preset) {
+  const perFace = (GEOM.headTop + GEOM.headBottom) / preset.head_frac * (preset.w / preset.h);   // crop width ÷ face height
+  return W / ((1 - 2 * CHECK.roomTol) * perFace * H);
+}
+
+/** Smallest face (share of the height) at the right distance. A photo too narrow to hold the
+ *  preset's crop at the bot's 22% (a 9:16 shot for a square size) gets a lower bar, just under
+ *  the largest face that fits, so "too far" and "too close for this size" leave a gap to pass. */
+export function minFace(W, H, preset) {
+  if (!preset) return CHECK.faceMin;
+  return Math.max(CHECK.faceFloor, Math.min(CHECK.faceMin, CHECK.fitShare * widestFit(W, H, preset)));
+}
+
+/** The live camera's head oval in the 300×400 viewBox of the 3:4 preview. A head that fills
+ *  it gives a face box about 0.37 of the frame height (head ≈ 1.6 face boxes). */
+export const OVAL = { cx: 150, top: 60, rx: 88, ry: 118, face: 0.37 };
+
+/** The oval for a preset → {cx, cy, rx, ry}: the default, or smaller (same top) when the crop
+ *  needs more room around the head, so a head that fills it still leaves space for the shoulders. */
+export function guideOval(preset) {
+  let k = 1;
+  if (preset) {
+    let fit = 0;   // largest face height (share of the frame) whose crop still fits
+    for (let r = 0.1; r <= CHECK.faceMax; r += 0.005) {
+      const fh = r * 400;
+      if (!cropFits({ x: OVAL.cx - fh / 2, y: OVAL.top + GEOM.headTop * fh, w: fh, h: fh }, 300, 400, preset)) break;
+      fit = r;
+    }
+    const lo = minFace(300, 400, preset);
+    let want = Math.max(1.1 * lo, 0.9 * fit);
+    if (want > fit && fit > lo) want = (lo + fit) / 2;   // a narrow window: aim for its middle
+    k = Math.min(1, want / OVAL.face);
+  }
+  const rx = Math.round(OVAL.rx * k * 10) / 10, ry = Math.round(OVAL.ry * k * 10) / 10;
+  return { cx: OVAL.cx, cy: OVAL.top + ry, rx, ry };
 }
 
 /**
@@ -194,6 +272,7 @@ export function maskMean(data, mw, mh, nbox) {
 /**
  * Which confidence mask is "person"? MediaPipe models differ (1 mask = person, or
  * [background, person]); the face we already found must be person, so test it.
+ * A single mask is always person: a low score there means the model missed you.
  * list: [{data, w, h}]; nface: face box normalised to 0..1. → {index, invert, score}
  */
 export function pickPersonMask(list, nface) {
@@ -201,7 +280,6 @@ export function pickPersonMask(list, nface) {
   list.forEach((m, index) => {
     const v = maskMean(m.data, m.w, m.h, nface);
     if (!best || v > best.score) best = { index, invert: false, score: v };
-    if (list.length === 1 && 1 - v > best.score) best = { index, invert: true, score: 1 - v };
   });
   return best;
 }
@@ -537,21 +615,29 @@ async function encodeJpeg(canvas, maxBytes) {
   return new Blob([bytes], { type: 'image/jpeg' });
 }
 
-/** The oval head guide: dims the outside, ring turns green when the live check passes. */
-function ovalOverlay() {
-  const cx = 150, cy = 178, rx = 88, ry = 118;
-  const ring = `M${cx - rx} ${cy}a${rx} ${ry} 0 1 0 ${2 * rx} 0a${rx} ${ry} 0 1 0 ${-2 * rx} 0z`;
-  const el = h('div', { class: 'overlay', html:
-    `<svg viewBox="0 0 300 400" preserveAspectRatio="xMidYMid slice" width="100%" height="100%" aria-hidden="true">
+/** The oval head guide: dims the outside, ring turns green when the live check passes.
+ *  shape(guideOval(preset)) resizes it for the chosen photo size. */
+function ovalOverlay(g) {
+  const el = h('div', { class: 'overlay' });
+  let path = null, state = '', key = '';
+  const set = s => {
+    state = s;
+    path.setAttribute('stroke', s === 'ok' ? '#34D399' : s === 'warn' ? '#FBBF24' : '#fff');
+    path.setAttribute('stroke-dasharray', s === 'ok' ? 'none' : '9 7');
+  };
+  const shape = ({ cx, cy, rx, ry }) => {
+    const ring = `M${cx - rx} ${cy}a${rx} ${ry} 0 1 0 ${2 * rx} 0a${rx} ${ry} 0 1 0 ${-2 * rx} 0z`;
+    if (ring === key) return;
+    key = ring;
+    el.innerHTML = `<svg viewBox="0 0 300 400" preserveAspectRatio="xMidYMid slice" width="100%" height="100%" aria-hidden="true">
       <path fill="rgba(10,8,24,.42)" fill-rule="evenodd" d="M0 0H300V400H0Z${ring}"/>
       <path class="ring" d="${ring}" fill="none" stroke="#fff" stroke-width="3" stroke-dasharray="9 7" stroke-linecap="round"/>
-    </svg>` });
-  const path = el.querySelector('.ring');
-  const set = state => {
-    path.setAttribute('stroke', state === 'ok' ? '#34D399' : state === 'warn' ? '#FBBF24' : '#fff');
-    path.setAttribute('stroke-dasharray', state === 'ok' ? 'none' : '9 7');
+    </svg>`;
+    path = el.querySelector('.ring');
+    if (state) set(state);
   };
-  return { el, set };
+  shape(g);
+  return { el, set, shape };
 }
 
 const CAM_ERRORS = {
@@ -571,13 +657,14 @@ CAM_ERRORS.noframes = CAM_ERRORS.black;
  * Live front camera with an oval guide. Start only from a user tap.
  * onCapture(canvas) gets the un-mirrored frame (exactly the area shown in the preview).
  * onFail(code) when the camera can't run; onClose(reason) when it closes without a photo.
+ * getPreset() → the chosen size or null; the oval and the live checks follow it.
  */
-function createCamera({ onCapture, onFail, onClose, onReady }) {
+function createCamera({ onCapture, onFail, onClose, onReady, getPreset = () => null }) {
   let stream = null, facing = 'user', timer = null, detector = null, stopped = false;
   let sawFrame = false, startedAt = 0, switching = false;
   const video = h('video', { playsinline: true, 'webkit-playsinline': true, muted: true, autoplay: true, 'aria-label': 'Camera preview' });
   video.muted = true; video.playsInline = true;
-  const oval = ovalOverlay();
+  const oval = ovalOverlay(guideOval(getPreset()));
   const hint = h('div', { class: 'camhint', role: 'status' }, 'Starting camera…');
   const flash = h('div', { style: { position: 'absolute', inset: '0', background: '#fff', opacity: '0', transition: 'opacity .3s', pointerEvents: 'none' } });
   const round = { width: '48px', height: '48px', borderRadius: '50%', border: '0', background: 'rgba(255,255,255,.22)', color: '#fff',
@@ -677,6 +764,8 @@ function createCamera({ onCapture, onFail, onClose, onReady }) {
     if (stopped || switching || !stream) return;
     if (!el.isConnected) { stop(); return; }                 // page changed under us
     try {
+      const preset = getPreset();
+      oval.shape(guideOval(preset));
       if (video.readyState >= 2 && video.videoWidth) {
         const cc = frameBox();
         const sw = 240, sh = Math.max(1, Math.round(240 * cc.sh / cc.sw));
@@ -691,7 +780,7 @@ function createCamera({ onCapture, onFail, onClose, onReady }) {
         }
         if (detector && sawFrame) {
           const faces = boxesFrom(detector.detect(small));
-          const a = analyzeFaces(faces, { w: sw, h: sh, live: true, brightness: f => regionMeanGray(data, sw, sh, f) });
+          const a = analyzeFaces(faces, { w: sw, h: sh, live: true, preset, brightness: f => regionMeanGray(data, sw, sh, f) });
           const g = liveHint(a);
           hint.textContent = g.text;
           oval.set(g.ok ? 'ok' : 'warn');
@@ -723,7 +812,8 @@ export async function mount(root, toolId) {
   const exam = toolId === 'examphoto';
   const S = {
     src: null, srcW: 0, srcH: 0, base: 'photo', origin: null, ac: null, k: 1, preview: null,
-    analysis: null, face: null, approved: false, token: 0, view: null, made: null, liveFailed: false, camCode: null,
+    analysis: null, check: null, status: null, face: null, approved: false, token: 0, view: null, made: null,
+    liveFailed: false, camCode: null,
   };
   let gen = 0;   // bumps when the document/size changes, so a stale make doesn't show
   let cam = null;
@@ -775,6 +865,7 @@ export async function mount(root, toolId) {
     closeCamera();
     if (S.liveFailed && !force) { renderFallback(S.camCode || 'unsupported'); return; }
     const c = createCamera({
+      getPreset: currentPreset,
       onReady: () => { S.liveFailed = false; S.camCode = null; },
       onCapture: canvas => { cam = null; usePhoto(canvas, canvas.width, canvas.height, 'selfie', 'camera'); },
       onFail: code => { cam = null; renderFallback(code); },
@@ -797,6 +888,7 @@ export async function mount(root, toolId) {
   // ── 2. document card ──
   let getPreset;
   const docCard = exam ? examDocCard() : passportDocCard();
+  const currentPreset = () => { const sel = getPreset(); return sel.ok ? sel.preset : null; };
 
   function passportDocCard() {
     let key = store.get('passport:preset', DEFAULT_PRESET);
@@ -876,8 +968,25 @@ export async function mount(root, toolId) {
   function presetChanged() {
     gen++;
     if (out.childNodes.length) out.replaceChildren();
+    recheck();
   }
   function setApproved(on) { S.approved = on; makeBtn.disabled = !on; }
+
+  /** Re-run the checks for the chosen size (the face boxes are cached, so this is cheap).
+   *  The view only changes when the list of issues does, so "Use this photo anyway" sticks. */
+  function recheck() {
+    const c = S.check;
+    if (!c || !S.analysis || !S.status) return;
+    const a = analyzeFaces(c.faces, { ...c.size, brightness: () => c.brightness, preset: currentPreset() });
+    const ids = x => x.issues.map(i => i.id).join();
+    const changed = ids(a) !== ids(S.analysis);
+    S.analysis = a;
+    if (!changed) return;
+    drawFaces(S.preview, a, S.preview.width / S.ac.width);
+    S.status.replaceChildren(...checksView(a));
+    setApproved(a.ok);
+    if (a.ok) personSegmenter().catch(() => { /* warm-up only */ });
+  }
 
   // ── photo in → analyse ──
   async function fromFile(file, origin) {
@@ -904,7 +1013,7 @@ export async function mount(root, toolId) {
     if (!keepSrc && S.src) { if (S.src.tagName === 'IMG') revokeImg(S.src); else freeCanvas(S.src); }
     freeCanvas(S.preview);
     if (S.made) freeCanvas(S.made.canvas);
-    Object.assign(S, { src: null, ac: null, preview: null, made: null, analysis: null, face: null, view: null });
+    Object.assign(S, { src: null, ac: null, preview: null, made: null, analysis: null, check: null, status: null, face: null, view: null });
   }
 
   async function usePhoto(src, W, H, base, origin, token) {
@@ -939,8 +1048,9 @@ export async function mount(root, toolId) {
       const ac = S.ac;
       const faces = boxesFrom(fd.detect(ac));
       const ax = ctx2d(ac, true);
+      const size = { w: ac.width, h: ac.height, origW: W, origH: H };
       const a = analyzeFaces(faces, {
-        w: ac.width, h: ac.height, origW: W, origH: H,
+        ...size, preset: currentPreset(),
         brightness: f => {
           const x0 = clamp(Math.floor(f.x), 0, ac.width - 1), y0 = clamp(Math.floor(f.y), 0, ac.height - 1);
           const x1 = clamp(Math.ceil(f.x + f.w), x0 + 1, ac.width), y1 = clamp(Math.ceil(f.y + f.h), y0 + 1, ac.height);
@@ -950,6 +1060,8 @@ export async function mount(root, toolId) {
       });
       if (my !== S.token) return;
       S.analysis = a;
+      S.check = { faces, size, brightness: a.brightness };
+      S.status = status;
       S.face = a.face ? { x: a.face.x / S.k, y: a.face.y / S.k, w: a.face.w / S.k, h: a.face.h / S.k } : null;
       p.done();
       drawFaces(preview, a, preview.width / ac.width);
@@ -1021,25 +1133,32 @@ export async function mount(root, toolId) {
     if (!sel.ok) { out.append(notice(sel.error, 'warn')); return; }
     const preset = sel.preset;
     const my = S.token, myGen = gen;
+    const stale = () => my !== S.token || myGen !== gen;   // another photo or size was picked meanwhile
+    const job = { src: S.src, srcW: S.srcW, srcH: S.srcH, face: S.face };
     const p = progress('Making your photo…');
     out.append(p.el);
     scrollToEl(p.el);
     try {
-      const made = await makePhoto(preset, p);
-      if (my !== S.token || myGen !== gen) { freeCanvas(made.canvas); p.done(); return; }
+      const made = await makePhoto(job, preset, p, stale);
+      if (!made) { p.done(); return; }
+      if (stale()) { freeCanvas(made.canvas); p.done(); return; }
       if (S.made) freeCanvas(S.made.canvas);
       S.made = made;
       p.done();
       await showResult(made, preset);
     } catch (e) {
+      if (stale()) { p.done(); return; }
       console.error(e);
       if (p.el.isConnected) p.fail(sayError(e)); else out.append(notice(sayError(e), 'err'));
     }
   }
 
-  async function makePhoto(preset, p) {
+  /** job: the photo as it was when Make was tapped. Returns null once stale() (the photo
+   *  may already be freed), so a replaced job never touches it after an await. */
+  async function makePhoto(job, preset, p, stale) {
     const seg = await loadModel('seg', p);
-    const face = S.face;
+    if (stale()) return null;
+    const { face } = job;
     const rect = cropRect(face, preset);
     const soft = rect.h < preset.h || rect.w < preset.w;
     // Work at up to 2× the target (never below it, and ≤ ~1700 px tall unless the target is
@@ -1048,9 +1167,11 @@ export async function mount(root, toolId) {
     const workW = Math.max(1, Math.round(workH * preset.w / preset.h));
     p.set(0.2, 'Framing head and shoulders…');
     await tick();
-    const work = drawRegion(S.src, S.srcW, S.srcH, rect, workW, workH);
+    if (stale()) return null;
+    const work = drawRegion(job.src, job.srcW, job.srcH, rect, workW, workH);
     p.set(0.4, 'Making the background white…');
     await tick();
+    if (stale()) { freeCanvas(work); return null; }
     const fk = workW / rect.w;
     const faceWork = { x: (face.x - rect.left) * fk, y: (face.y - rect.top) * fk, w: face.w * fk, h: face.h * fk };
     let bg;
@@ -1062,7 +1183,9 @@ export async function mount(root, toolId) {
     if (final !== work) freeCanvas(work);
     const blob = await encodeJpeg(final, preset.max_kb * 1024);
     p.set(1, 'Done');
-    return { canvas: final, blob, soft, bg, preset };
+    // Backstop for "Use this photo anyway": say where white had to be filled in.
+    const fit = cropOverflow(face, job.srcW, job.srcH, preset);
+    return { canvas: final, blob, soft, bg, preset, fit };
   }
 
   async function showResult(made, preset) {
@@ -1076,6 +1199,10 @@ export async function mount(root, toolId) {
     const rc = await resultCard({ title: exam ? 'Exam photo ready' : 'Passport photo ready', blob, filename, note });
     out.append(rc);
     if (!under) out.append(notice(`Couldn’t get this photo under ${preset.max_kb} KB without ruining it. Try a smaller pixel size, or check the limit on the portal.`, 'warn'));
+    const { fit } = made;
+    const sides = Math.max(fit.left, fit.right) > CHECK.roomTol, bottom = fit.bottom > CHECK.roomTol;
+    if (sides || bottom) out.append(notice(`You were too close for this photo size, so white was filled in ${sides && bottom ? 'at the sides and bottom' : sides ? 'at the sides' : 'at the bottom'}. Step back a little and retake for a clean result.`, 'warn'));
+    if (fit.crown > CHECK.roomTol) out.append(notice('The top of your head is cut off in this photo. Retake with a little space above your hair.', 'warn'));
     if (!made.bg.ok) out.append(notice('Couldn’t separate you from the background cleanly, so the original background was kept. Stand in front of a plain, light wall and try again.', 'warn'));
     if (made.soft) out.append(notice('This photo may look soft: your face was smaller than the target size, so it was enlarged. For a crisper result, move closer or use the rear camera.', 'warn'));
     if (preset.sheet) out.append(sheetCard(made, preset));
@@ -1093,12 +1220,15 @@ export async function mount(root, toolId) {
       paperLine.textContent = `${L.copies} photos of ${physical(preset)} on ${L.paper.label} paper, 300 dpi, with cut lines.`;
     };
     const seg = segmented(opts.map(n => [String(n), String(n)]), String(copies), v => { copies = Number(v); update(); sheetOut.replaceChildren(); });
+    // Each build gets its own box: changing the copy count empties sheetOut, so a build that is
+    // still running ends up in a detached box and never shows a sheet for the old count.
     const btn = button('Make print sheet', () => busy(btn, async () => {
-      sheetOut.replaceChildren();
+      const run = h('div', {});
+      sheetOut.replaceChildren(run);
       const p = progress('Laying out your sheet…');
-      sheetOut.append(p.el);
-      try { await buildSheet(made, preset, copies, sheetOut, p); }
-      catch (e) { console.error(e); if (p.el.isConnected) p.fail(sayError(e)); else sheetOut.append(notice(sayError(e), 'err')); }
+      run.append(p.el);
+      try { await buildSheet(made, preset, copies, run, p); }
+      catch (e) { console.error(e); if (p.el.isConnected) p.fail(sayError(e)); else if (run.isConnected) run.append(notice(sayError(e), 'err')); }
     }), { full: true, icon: '🖨' });
     update();
     return card({ title: 'Print sheet', sub: 'Several copies on one sheet, for any photo shop.' },
@@ -1121,11 +1251,13 @@ export async function mount(root, toolId) {
     let jpg;
     try { jpg = setJpegDpi(new Uint8Array(await (await canvasToBlob(sheet, 'image/jpeg', 0.92)).arrayBuffer()), PRINT_DPI); }
     finally { freeCanvas(sheet); }
+    if (!into.isConnected) return;   // copy count changed (or the page left): drop this sheet
     p.set(0.7, 'Saving the PDF…');
     await tick();
     const PDFLib = await libs.pdfLib();
     const pdf = await sheetPdf(PDFLib, jpg, L.paper);
     p.done();
+    if (!into.isConnected) return;
     const base = `${S.base}_print_${L.paper.id}`;
     const jpgBlob = new Blob([jpg], { type: 'image/jpeg' });
     const pdfBlob = new Blob([pdf], { type: 'application/pdf' });

@@ -9,7 +9,7 @@ import {
 import { libs } from '../lib.js';
 import {
   UserError, friendlyError, errorNotice, plural, pagesLabel, parseRanges, uniqueSorted, compactRanges,
-  openPdf, newPdf, copyToNew, savePdf, rotatePages, addPageNumbers, addWatermark, needsPicture,
+  openPdf, newPdf, copyToNew, copyPagesInto, savePdf, pdfBytes, rotatePages, addPageNumbers, addWatermark, needsPicture,
   WATERMARK_COLOURS, NUMBER_FORMATS, pageNumberText, imagePageLayout, openPdfjs, renderPage, dropCanvas,
   textItemsToText, joinPages, inkChars, wordCount,
 } from './pdf-util.js';
@@ -79,9 +79,11 @@ function runButton(label, out, fn) {
 /**
  * Single-PDF input: picker + "12 pages · 3.4 MB" line (or the error, right away).
  * engine 'lib' parses with pdf-lib (needed to edit); 'pdfjs' only reads (text tools).
- * get() → {file, bytes, pages, doc?} or throws a UserError.
+ * readOnly: a note to show when the PDF has editing restrictions. Such a PDF is then
+ * still accepted (src.restricted holds the error for runs that need to edit it).
+ * get() → {file, bytes, pages, doc?, restricted?} or throws a UserError.
  */
-function pdfInput({ engine = 'lib', onReady } = {}) {
+function pdfInput({ engine = 'lib', readOnly, onReady } = {}) {
   let cur = null;
   const info = h('div', { class: 'hidden' });
   const show = (...nodes) => {
@@ -106,13 +108,22 @@ function pdfInput({ engine = 'lib', onReady } = {}) {
         await task.destroy();
         return { file, bytes, pages };
       }
-      const doc = await openPdf(bytes);
-      return { file, bytes, doc, pages: doc.getPageCount(), used: false };
+      try {
+        const doc = await openPdf(bytes);
+        return { file, bytes, doc, pages: doc.getPageCount(), used: false };
+      } catch (e) {
+        if (!readOnly || !(e instanceof UserError) || e.kind !== 'restricted') throw e;
+        const { pdf, task } = await openPdfjs(bytes);
+        const pages = pdf.numPages;
+        await task.destroy();
+        return { file, bytes, pages, restricted: e };
+      }
     })();
     try {
       const src = await mine.promise;
       if (cur !== mine) return;
       show(h('div', { class: 'muted small' }, `📄 ${pagesLabel(src.pages)} · ${fmtBytes(file.size)}`),
+        src.restricted && notice(readOnly, 'info'),
         file.size > 60 * 1024 * 1024 && notice('This is a big file, so it may take a while on a phone.', 'info'));
       onReady && onReady(src);
     } catch (e) {
@@ -199,7 +210,7 @@ function fileList({ accept, label, hint, icon, thumbs = false, describe, onChang
       const meta = h('div', { class: 's' }, fmtBytes(f.size));
       if (describe) describe(f).then(t => { meta.textContent = `${fmtBytes(f.size)} · ${t}`; }, e => {
         const k = friendlyError(e).kind;
-        meta.textContent = k === 'locked' ? 'Password-protected' : k === 'invalid' ? 'Not a readable PDF' : 'Can’t read this file';
+        meta.textContent = k === 'locked' ? 'Password-protected' : k === 'restricted' ? 'Editing restricted' : k === 'invalid' ? 'Not a readable PDF' : 'Can’t read this file';
         meta.style.color = 'var(--err)';
       });
       const move = d => { [files[i], files[i + d]] = [files[i + d], files[i]]; changed(); };
@@ -246,9 +257,7 @@ function mergeTool(root) {
       p.set(i / files.length, `Adding file ${i + 1} of ${files.length}`);
       await tick();
       const src = await load(files[i]);
-      const pages = await merged.copyPages(src, src.getPageIndices());
-      for (const pg of pages) merged.addPage(pg);
-      total += pages.length;
+      total += (await copyPagesInto(merged, src, src.getPageIndices())).length;
     }
     p.set(null, 'Saving…'); await tick();
     const blob = await savePdf(merged);
@@ -286,7 +295,7 @@ function splitTool(root) {
     for (let i = 0; i < src.pages; i++) {
       p.set(i / src.pages, `Page ${i + 1} of ${src.pages}`);
       const one = await copyToNew(src.doc, [i]);
-      entries[`${base}_p${String(i + 1).padStart(digits, '0')}.pdf`] = [await one.save({ useObjectStreams: true }), { level: 0 }];
+      entries[`${base}_p${String(i + 1).padStart(digits, '0')}.pdf`] = [await pdfBytes(one), { level: 0 }];
       await tick();
       if (!root.isConnected) return null;
     }
@@ -306,7 +315,7 @@ const STRONG = { low: { dpi: 72, q: 0.5 }, medium: { dpi: 110, q: 0.6 }, high: {
 function compressTool(root) {
   const out = h('div');
   let mode = 'smart', quality = 'medium';
-  const input = pdfInput({ onReady: () => out.replaceChildren() });
+  const input = pdfInput({ readOnly: 'This PDF has editing restrictions, so only Strong can compress it.', onReady: () => out.replaceChildren() });
   const smartHint = hintEl('Keeps text, links and bookmarks. Best for PDFs made by apps; scans barely shrink.');
   const strong = h('div', { class: 'stack hidden' },
     labelled('Quality', segmented([['low', 'Low'], ['medium', 'Medium'], ['high', 'High']], quality, v => { quality = v; out.replaceChildren(); }),
@@ -333,6 +342,7 @@ function compressTool(root) {
   const go = runButton('Compress PDF', out, async p => {
     const src = await input.get();
     if (mode === 'smart') {
+      if (src.restricted) throw src.restricted;
       p.set(null, 'Compressing…'); await tick();
       return outcome(src.file, await savePdf(await freshDoc(src)));
     }
