@@ -1,5 +1,6 @@
 // SnappTo UI kit — the ONLY building blocks tool modules should use, so every
 // screen looks and behaves the same. All helpers return plain DOM nodes.
+import { inTelegram, openOutside, pageUrl } from './tg.js';
 
 /** h('div', {class:'x', onclick:fn, style:{...}, dataset:{...}}, ...children) */
 export function h(tag, props = {}, ...children) {
@@ -215,9 +216,13 @@ export async function resultCard({ title = 'Done', blob, filename = 'output', be
     h('div', { class: 'meta' }, [filename, size != null ? fmtBytes(size) : null].filter(Boolean).join(' · ')),
     deltaEl,
     note && h('div', { class: 'meta', style: { marginTop: '8px' } }, note),
+    // Telegram's in-app view often drops downloads, so offer Share and the phone's browser.
+    blob && inTelegram && h('div', { class: 'meta', style: { marginTop: '8px' } },
+      'Inside Telegram a download may not save. If nothing appears, tap Share, or open SnappTo in your browser and run it there.'),
     blob && h('div', { class: 'acts' },
       button('Download', () => download(blob, filename), { variant: 'primary' }),
-      canShareFiles() && button('Share', () => share(blob, filename), { variant: 'secondary' }))));
+      canShareFiles() && button('Share', () => share(blob, filename), { variant: 'secondary' }),
+      inTelegram && button('Open in browser', () => openOutside(pageUrl()), { variant: 'secondary' }))));
   announce(title);
   return box;
 }

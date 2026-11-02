@@ -1,3 +1,4 @@
+import { inTelegram, openOutside, pageUrl } from './tg.js';   // clears Telegram's launch data before the first render
 import { CATEGORIES, CAT, TOOL, TOOLS, PASSPORT, PASSPORT_ITEMS, QUICK, search, botLink, BOT_USERNAME } from './catalog.js';
 import { GUIDES, DISCLAIMER } from './guidance.js';
 import { h, card, button, notice, toast, segmented, fmtBytes, announce, releasePreviews } from './ui.js';
@@ -357,6 +358,9 @@ async function morePage() {
     segmented([['auto', 'Automatic'], ['light', 'Light'], ['dark', 'Dark']], cur, v => { store.set('theme', v); applyTheme(); })));
 
   view.append(label('SnappTo'), h('div', { class: 'group' },
+    inTelegram && h('button', { class: 'item', onclick: () => openOutside(pageUrl().replace(/#.*$/, '#/')) },
+      h('span', { class: 'ic hue-soft', style: { color: 'var(--brand)' } }, '🌐'),
+      h('span', { class: 'txt' }, h('div', { class: 't' }, 'Open in your browser'), h('div', { class: 'd' }, 'Saves files reliably, and you can install it for offline use')), svg(I.chev)),
     h('a', { class: 'item', href: `https://t.me/${BOT_USERNAME}`, target: '_blank', rel: 'noopener' },
       h('span', { class: 'ic', style: { background: '#2AABEE' } }, '✈️'),
       h('span', { class: 'txt' }, h('div', { class: 't' }, 'Telegram bot'), h('div', { class: 'd' }, '@' + BOT_USERNAME)), svg(I.chev)),
@@ -400,7 +404,7 @@ const standalone = () => matchMedia('(display-mode: standalone)').matches || nav
 const isIOS = () => /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 function installBanner() {
   // '' not null: native Element.append() would print the text "null".
-  if (standalone() || store.get('installDismissed', false)) return '';
+  if (inTelegram || standalone() || store.get('installDismissed', false)) return '';
   if (!deferredInstall && !isIOS()) return '';
   const close = h('button', { class: 'x', 'aria-label': 'Dismiss', onclick: () => { store.set('installDismissed', true); el.remove(); } }, '×');
   const body = isIOS()
